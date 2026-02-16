@@ -41,5 +41,9 @@ This will open the application in your default web browser (usually at `http://l
 3.  The app will automatically pair subtitle files with metadata JSONs if they share the same filename.
 4.  Click **"Process Local Files"**.
 
-### Export
-Once files are processed (from either tab), a **"Download ZIP"** button will appear at the bottom. Click it to download a ZIP archive containing all the cleaned, formatted text files ready for LLM use.
+### Export & Merging
+1.  **Merge Strategy**: In the sidebar, choose how you want your files:
+    *   **No Merge**: Standard behavior. One text file per video, downloaded as a ZIP.
+    *   **One File**: All videos are concatenated into a single `All_Processed_Videos.txt` file.
+    *   **Medium/Large Chunks**: Videos are grouped into batches (approx 50k or 200k characters) to fit context windows, downloaded as a ZIP of batches.
+2.  Once files are processed, click the **"Download"** button at the bottom. The button label will adapt to your chosen strategy.
