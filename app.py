@@ -8,6 +8,7 @@ import tempfile
 import json
 import shutil
 import time
+import traceback
 import uuid
 
 # --- Configuration & Setup ---
@@ -151,6 +152,16 @@ def clean_vtt_content(content: str) -> str:
 
     return "\n".join(cleaned_lines)
 
+class MyLogger:
+    def __init__(self):
+        self.errors = []
+    def debug(self, msg):
+        pass
+    def warning(self, msg):
+        pass
+    def error(self, msg):
+        self.errors.append(msg)
+
 def format_for_llm(metadata: dict, transcript: str) -> str:
     """
     Formats the final output string for LLM ingestion.
@@ -175,106 +186,176 @@ def format_for_llm(metadata: dict, transcript: str) -> str:
 {transcript}
 """
 
-def process_youtube(urls: list, group_by_playlist: bool, progress_bar, status_text):
+def fetch_playlist_info(urls: list, browser: str = "None") -> list:
     """
-    Downloads metadata and subtitles from YouTube using yt-dlp,
+    Fetches playlist metadata quickly using extract_flat=True.
+    Returns a list of dictionaries with video details (Title, URL, ID, etc.)
+    """
+    logger = MyLogger()
+    flat_opts = {
+        'extract_flat': True,
+        'dump_single_json': True,
+        'quiet': True,
+        'ignoreerrors': True,
+        'logger': logger,
+    }
+
+    if browser and browser != "None":
+        flat_opts['cookiesfrombrowser'] = browser
+
+    video_list = []
+    
+    with yt_dlp.YoutubeDL(flat_opts) as ydl:
+        for url in urls:
+            try:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    continue
+                    
+                if 'entries' in info:
+                    # It's a playlist or channel
+                    playlist_title = info.get('title', 'Unknown Playlist')
+                    for entry in info['entries']:
+                        if entry:
+                            entry['playlist_title'] = playlist_title
+                            # Ensure we have a valid URL or ID to construct one
+                            if not entry.get('url') and entry.get('id'):
+                                entry['url'] = f"https://www.youtube.com/watch?v={entry['id']}"
+                            elif not entry.get('url') and entry.get('webpage_url'):
+                                entry['url'] = entry['webpage_url']
+                                
+                            video_list.append(entry)
+                else:
+                    # Single video
+                    # Ensure consistency in keys
+                    if not info.get('url') and info.get('webpage_url'):
+                        info['url'] = info['webpage_url']
+                    elif not info.get('url') and info.get('id'):
+                        info['url'] = f"https://www.youtube.com/watch?v={info['id']}"
+                        
+                    video_list.append(info)
+            except Exception as e:
+                st.error(f"Error gathering metadata for {url}: {str(e)}")
+    
+    return video_list
+
+def download_videos(video_list: list, group_by_playlist: bool, progress_bar, status_text, browser: str = "None"):
+    """
+    Downloads metadata and subtitles for a specific list of videos,
     cleans them, and prepares final text files.
     """
     processed_files = []
-    
     session_dir = ensure_session_dir()
-    
-    ydl_opts = {
+    logger = MyLogger()
+
+    # Options for actual downloading of individual videos
+    download_opts = {
         'skip_download': True,
         'write_sub': True,
-        'write_auto_sub': True, # Prefer auto-subs if manual not available
-        'sub_langs': ['en', 'ru', 'uk'], # Priority order
+        'write_auto_sub': True,
+        'sub_langs': ['en', 'ru', 'uk'],
         'write_info_json': True,
-        'write_description': False, # We get description from info.json
+        'write_description': False,
         'outtmpl': str(session_dir / '%(title)s [%(id)s].%(ext)s'),
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True, # Critical to not crash on one failed video
+        'ignoreerrors': True,
+        'logger': logger,
     }
 
     if group_by_playlist:
-        ydl_opts['outtmpl'] = str(session_dir / '%(playlist_title)s/%(title)s [%(id)s].%(ext)s')
+        download_opts['outtmpl'] = str(session_dir / '%(playlist_title)s/%(title)s [%(id)s].%(ext)s')
 
-    status_text.text("Starting extraction...")
+    if browser and browser != "None":
+        download_opts['cookiesfrombrowser'] = browser
+
+    total_videos = len(video_list)
+    if total_videos == 0:
+        st.warning("No videos to process.")
+        return []
+
+    status_text.text(f"Starting download for {total_videos} videos...")
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        for url in urls:
-            status_text.text(f"Processing URL: {url}")
+    # Process each video
+    with yt_dlp.YoutubeDL(download_opts) as ydl:
+        for i, video_info in enumerate(video_list):
+            url = video_info.get('url')
+            title = video_info.get('title', 'Video')
+            
+            progress_bar.progress((i) / total_videos, text=f"Processing {i+1}/{total_videos}: {title}")
+            
             try:
-                # 1. Extract Info & Download Subs
+                # 1. Download for this specific video
+
+                # Note: We re-extract info with download=True for full metadata + subs
                 info = ydl.extract_info(url, download=True)
+                if not info:
+                    print(f"Failed to extract info for {title}")
+                    continue
                 
-                # Handle playlists vs single video
-                entries = []
-                if 'entries' in info:
-                    entries = info['entries']
+                # 2. Find generated files
+                video_id = info.get('id')
+                files_found = list(session_dir.rglob(f"*[{video_id}]*"))
+                
+                json_file = next((f for f in files_found if f.suffix == '.json'), None)
+                sub_file = next((f for f in files_found if f.suffix in ['.vtt', '.srt']), None)
+
+                if not json_file:
+                    st.warning(f"Metadata not found for {title}. Skipping.")
+                    continue
+                
+                # Load Metadata
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    meta_data = json.load(f)
+
+                # Load and Clean Transcript
+                transcript_text = ""
+                if sub_file:
+                     with open(sub_file, 'r', encoding='utf-8') as f:
+                        raw_subs = f.read()
+                        transcript_text = clean_vtt_content(raw_subs)
                 else:
-                    entries = [info]
+                    transcript_text = "[No subtitles available]"
 
-                total_entries = len(entries)
-                for i, entry in enumerate(entries):
-                    if not entry: continue # Skip None entries from ignoreerrors
-
-                    title = entry.get('title', 'video')
-                    # Update progress
-                    progress_bar.progress((i + 1) / total_entries, text=f"Processing: {title}")
-
-                    # 2. Find the generated files
-                    # yt-dlp doesn't return the exact paths of downloaded subs easily in the return dict
-                    # So we search the temp dir for files matching the ID.
-                    video_id = entry.get('id')
-                    
-                    # Search pattern depends on whether we grouped by playlist or not
-                    # But simpler is to walk the TEMP_DIR and look for the ID
-                    files_found = list(session_dir.rglob(f"*[{video_id}]*"))
-                    
-                    json_file = next((f for f in files_found if f.suffix == '.json'), None)
-                    sub_file = next((f for f in files_found if f.suffix in ['.vtt', '.srt']), None)
-
-                    if not json_file:
-                        st.warning(f"Metadata not found for {title}. Skipping.")
-                        continue
-                    
-                    # Load Metadata
-                    with open(json_file, 'r', encoding='utf-8') as f:
-                        meta_data = json.load(f)
-
-                    # Load and Clean Transcript
-                    transcript_text = ""
-                    if sub_file:
-                         with open(sub_file, 'r', encoding='utf-8') as f:
-                            raw_subs = f.read()
-                            transcript_text = clean_vtt_content(raw_subs)
-                    else:
-                        transcript_text = "[No subtitles available]"
-
-                    # Format Final Output
-                    final_content = format_for_llm(meta_data, transcript_text)
-                    
-                    # Save Final File
-                    # We'll save it to a 'processed' subdir to separate from raw downloads
-                    output_dir = session_dir / "processed"
-                    if group_by_playlist and 'playlist_title' in entry and entry['playlist_title']:
-                        safe_playlist_title = "".join([c for c in entry['playlist_title'] if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                # Format Final Output
+                final_content = format_for_llm(meta_data, transcript_text)
+                
+                # Save Final File
+                output_dir = session_dir / "processed"
+                
+                # Use playlist title from initial metadata if available and grouping enabled
+                pl_title = video_info.get('playlist_title')
+                if group_by_playlist:
+                     # Check if we have playlist info from the individual extraction or the flat one
+                     if 'playlist_title' in info and info['playlist_title']:
+                         pl_title = info['playlist_title']
+                     
+                     if pl_title:
+                        safe_playlist_title = "".join([c for c in pl_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
                         output_dir = output_dir / safe_playlist_title
-                    
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
-                    final_filename = output_dir / f"{safe_title}.txt"
-                    
-                    with open(final_filename, 'w', encoding='utf-8') as f:
-                        f.write(final_content)
-                    
-                    processed_files.append(final_filename)
-
+                
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                final_filename = output_dir / f"{safe_title}.txt"
+                
+                with open(final_filename, 'w', encoding='utf-8') as f:
+                    f.write(final_content)
+                
+                processed_files.append(final_filename)
+                
             except Exception as e:
-                st.error(f"Error processing {url}: {str(e)}")
+                logger.error(f"Failed to process {title}: {str(e)}")
+                print(f"Failed to process {title}: {e}")
+                traceback.print_exc()
+                pass
+
+    progress_bar.progress(1.0, text="Done!")
+
+    if logger.errors:
+        with st.expander("Show Detailed Error Log"):
+            for err in logger.errors:
+                st.error(err)
 
     return processed_files
 
@@ -282,6 +363,11 @@ def process_youtube(urls: list, group_by_playlist: bool, progress_bar, status_te
 
 def main():
     st.sidebar.title("Available Settings")
+    
+    st.sidebar.markdown("### YouTube Bot Bypass")
+    st.sidebar.info("If you get 'Sign in to confirm you’re not a bot', select your browser below to use its cookies.")
+    browser_options = ["None", "chrome", "firefox", "safari", "edge", "opera", "vivaldi"]
+    browser_choice = st.sidebar.selectbox("Cookies from Browser:", browser_options, index=0)
     
     # merge_options in Export section now
     
@@ -295,41 +381,92 @@ def main():
     with tab1:
         st.header("YouTube Downloader & Extractor")
         
-        urls_input = st.text_area("Enter YouTube URLs (one per line):", height=150)
+        col1, col2 = st.columns([0.8, 0.2])
+        with col1:
+             urls_input = st.text_area("Enter YouTube URLs (one per line):", height=100)
+        with col2:
+             st.write("")
+             st.write("")
+             if st.button("Clear/Reset", type="secondary"):
+                 if 'video_list' in st.session_state:
+                     del st.session_state['video_list']
+                 st.rerun()
+
         group_playlist = st.checkbox("Group by Playlist/Channel", value=True)
         
-        if st.button("Start Harvesting", type="primary"):
+        # Initialize video_list in session state if not present
+        if 'video_list' not in st.session_state:
+            st.session_state.video_list = None
+
+        if st.button("Fetch Video List", type="primary"):
             if not urls_input.strip():
                 st.error("Please enter at least one URL.")
             else:
                 urls = [u.strip() for u in urls_input.splitlines() if u.strip()]
-                
-                # UI Elements for progress
-                progress_bar = st.progress(0, text="Ready to start...")
-                status_text = st.empty()
-                
-                # clear previous run? maybe optional, but safer to avoid mixing
-                # For now let's just process and add to session.
-                # Actually, user might want to accumulate. 
-                # Let's verify TEMP_DIR is clean or handle conflicts.
-                # For simplicity in this session-based app, we'll clear temp on new run if requested
-                # but 'processed_files' relies on them existing. 
-                # Ideally, we should copy processed files to a persistent list.
-                
-                # Let's just clear temp dir at start of a batch? 
-                # If we clear temp dir, we lose previous files if the user didn't download.
-                # Let's NOT clear, just append.
-                
-                new_files = process_youtube(urls, group_playlist, progress_bar, status_text)
-                
-                if new_files:
-                    st.session_state['processed_files'].extend(new_files)
-                    st.success(f"Successfully processed {len(new_files)} videos!")
+                with st.spinner("Fetching playlist info..."):
+                    videos = fetch_playlist_info(urls, browser=browser_choice)
+                    
+                if videos:
+                    # Add a 'selected' key to each video for the checkbox
+                    for v in videos:
+                        v['selected'] = True
+                    st.session_state.video_list = videos
+                    st.success(f"Found {len(videos)} videos.")
                 else:
-                    st.warning("No videos were processed successfully.")
-                
-                progress_bar.empty()
-                status_text.empty()
+                     st.warning("No videos found or unable to fetch metadata.")
+
+        # If we have a fetched list, show the selection UI
+        if st.session_state.video_list:
+            st.divider()
+            st.subheader("Select Videos to Download")
+            
+            # Prepare data for data_editor
+            # We want to edit the 'selected' boolean.
+            # Convert list of dicts to a format suitable for data_editor?
+            # Actually, st.data_editor works well with list of dicts or dataframes.
+            # Let's use the list of dicts directly if possible, but we need to ensure it updates session state.
+            
+            edited_data = st.data_editor(
+                st.session_state.video_list,
+                column_config={
+                    "selected": st.column_config.CheckboxColumn(
+                        "Download?",
+                        help="Select to download this video",
+                        default=True,
+                    ),
+                    "title": "Video Title",
+                    "url": st.column_config.LinkColumn("URL"),
+                    "playlist_title": "Playlist/Channel",
+                    # Hide internal keys if needed, but data_editor shows all by default unless configured.
+                    "id": None, # Hide ID
+                    "entries": None,
+                },
+                disabled=["title", "url", "playlist_title", "id", "entries"],
+                hide_index=True,
+                use_container_width=True,
+                key="video_editor"
+            )
+            
+            # Count selected
+            selected_videos = [v for v in edited_data if v.get('selected', True)]
+            st.write(f"Selected: **{len(selected_videos)}** / {len(edited_data)}")
+            
+            if st.button("Start Harvesting Selected Videos", type="primary", disabled=len(selected_videos)==0):
+                 result_container = st.container()
+                 with result_container:
+                    progress_bar = st.progress(0, text="Ready to start...")
+                    status_text = st.empty()
+                    
+                    new_files = download_videos(selected_videos, group_playlist, progress_bar, status_text, browser=browser_choice)
+                    
+                    if new_files:
+                        st.session_state['processed_files'].extend(new_files)
+                        st.success(f"Successfully processed {len(new_files)} videos!")
+                    else:
+                        st.warning("No videos were processed.")
+                    
+                    progress_bar.empty()
+                    status_text.empty()
 
     # --- TAB 2: Local Files ---
     with tab2:
