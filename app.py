@@ -10,6 +10,7 @@ import shutil
 import time
 import traceback
 import uuid
+import subprocess
 
 # --- Configuration & Setup ---
 st.set_page_config(
@@ -201,7 +202,8 @@ def fetch_playlist_info(urls: list, browser: str = "None") -> list:
     }
 
     if browser and browser != "None":
-        flat_opts['cookiesfrombrowser'] = browser
+        flat_opts['cookiesfrombrowser'] = (browser,)
+        flat_opts['remote_components'] = ['ejs:github']
 
     video_list = []
     
@@ -250,24 +252,22 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
 
     # Options for actual downloading of individual videos
     download_opts = {
+        'format': 'best',
         'skip_download': True,
         'write_sub': True,
         'write_auto_sub': True,
         'sub_langs': ['en', 'ru', 'uk'],
         'write_info_json': True,
         'write_description': False,
-        'outtmpl': str(session_dir / '%(title)s [%(id)s].%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
+        'quiet': False, # Changed to False for better debugging in script
+        'no_warnings': False, # Changed to False
         'ignoreerrors': True,
         'logger': logger,
     }
 
-    if group_by_playlist:
-        download_opts['outtmpl'] = str(session_dir / '%(playlist_title)s/%(title)s [%(id)s].%(ext)s')
-
     if browser and browser != "None":
-        download_opts['cookiesfrombrowser'] = browser
+        download_opts['cookiesfrombrowser'] = (browser,)
+        download_opts['remote_components'] = ['ejs:github']
 
     total_videos = len(video_list)
     if total_videos == 0:
@@ -277,50 +277,56 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
     status_text.text(f"Starting download for {total_videos} videos...")
     
     # Process each video
-    with yt_dlp.YoutubeDL(download_opts) as ydl:
-        for i, video_info in enumerate(video_list):
-            url = video_info.get('url')
-            title = video_info.get('title', 'Video')
+    for i, video_info in enumerate(video_list):
+        url = video_info.get('url')
+        title = video_info.get('title', 'Video')
+        video_id = video_info.get('id')
+        
+        progress_bar.progress((i) / total_videos, text=f"Processing {i+1}/{total_videos}: {title}")
+        
+        # Determine the output folder for this specific video
+        video_out_dir = session_dir
+        if group_by_playlist:
+            # Use playlist title from our fetched metadata
+            pl_title = video_info.get('playlist_title', 'Unknown Playlist')
+            safe_pl_title = "".join([c for c in pl_title if c.isalnum() or c in ' -_']).strip()
+            video_out_dir = session_dir / safe_pl_title
+        
+        video_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Build options for THIS video
+        # We'll use subprocess to run the CLI which we've verified works better for some reason
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-sub",
+            "--write-auto-sub",
+            "--sub-langs", "en,ru,uk",
+            "--write-info-json",
+            "--no-warnings",
+            "--quiet",
+            "--remote-components", "ejs:github",
+            "-o", str(video_out_dir / '%(title)s [%(id)s].%(ext)s'),
+            url
+        ]
+        
+        if browser and browser != "None":
+            cmd.extend(["--cookies-from-browser", browser])
             
-            progress_bar.progress((i) / total_videos, text=f"Processing {i+1}/{total_videos}: {title}")
+        try:
+            # Execute download via CLI
+            subprocess.run(cmd, check=False)
             
-            try:
-                # 1. Download for this specific video
+            # Find generated files
+            files_found = list(video_out_dir.glob(f"*{video_id}*"))
+            
+            if not files_found:
+                # Alternative search in case of nested dirs or extension issues
+                files_found = list(video_out_dir.rglob(f"*{video_id}*"))
 
-                # Note: We re-extract info with download=True for full metadata + subs
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    print(f"Failed to extract info for {title}")
+                if not files_found:
+                    st.warning(f"Files not found for {title} ({video_id})")
                     continue
-                
-                # 2. Find generated files
-                video_id = info.get('id')
-                # Debugging: Print what we are looking for
-                print(f"DEBUG: Looking for files with video_id: {video_id} in {session_dir}")
-                
-                # We need to be careful. If group_by_playlist is on, files are in subfolders.
-                # rglob should find them.
-                # The template is '... [%(id)s].%(ext)s', so we look for the ID.
-                # Sometimes file systems or yt-dlp might behave slightly differently with brackets.
-                
-                # First try explicit bracket match which is most accurate
-                files_found = list(session_dir.rglob(f"*[{video_id}]*"))
-                
-                if not files_found:
-                    # Fallback: search for just the ID, but be careful of partial matches
-                    # YouTube IDs are 11 chars.
-                    all_matches = list(session_dir.rglob(f"*{video_id}*"))
-                    # Filter to ensure it's likely the ID (e.g. at end of name or preceded by space/bracket)
-                    files_found = all_matches
-                    if files_found:
-                        print(f"DEBUG: Found files via fallback for {video_id}: {[f.name for f in files_found]}")
-
-                # Debugging
-                if not files_found:
-                     print(f"DEBUG: No files found for video_id: {video_id} in {session_dir}. Files in dir:")
-                     # List a few files to see what's happening
-                     for i, f in enumerate(session_dir.rglob("*")):
-                         if i < 5: print(f"  {f.name}")
                 
                 json_file = next((f for f in files_found if f.suffix == '.json'), None)
                 sub_file = next((f for f in files_found if f.suffix in ['.vtt', '.srt']), None)
@@ -347,21 +353,13 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
                 
                 # Save Final File
                 output_dir = session_dir / "processed"
-                
-                # Use playlist title from initial metadata if available and grouping enabled
-                pl_title = video_info.get('playlist_title')
-                if group_by_playlist:
-                     # Check if we have playlist info from the individual extraction or the flat one
-                     if 'playlist_title' in info and info['playlist_title']:
-                         pl_title = info['playlist_title']
-                     
-                     if pl_title:
-                        safe_playlist_title = "".join([c for c in pl_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
-                        output_dir = output_dir / safe_playlist_title
+                if group_by_playlist and pl_title:
+                     safe_playlist_title = "".join([c for c in pl_title if c.isalnum() or c in ' -_']).strip()
+                     output_dir = output_dir / safe_playlist_title
                 
                 output_dir.mkdir(parents=True, exist_ok=True)
                 
-                safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+                safe_title = "".join([c for c in title if c.isalnum() or c in ' -_']).strip()
                 final_filename = output_dir / f"{safe_title}.txt"
                 
                 with open(final_filename, 'w', encoding='utf-8') as f:
@@ -369,11 +367,10 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
                 
                 processed_files.append(final_filename)
                 
-            except Exception as e:
-                logger.error(f"Failed to process {title}: {str(e)}")
-                print(f"Failed to process {title}: {e}")
-                traceback.print_exc()
-                pass
+        except Exception as e:
+            logger.error(f"Failed to process {title}: {str(e)}")
+            traceback.print_exc()
+            pass
 
     progress_bar.progress(1.0, text="Done!")
 
