@@ -295,7 +295,32 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
                 
                 # 2. Find generated files
                 video_id = info.get('id')
+                # Debugging: Print what we are looking for
+                print(f"DEBUG: Looking for files with video_id: {video_id} in {session_dir}")
+                
+                # We need to be careful. If group_by_playlist is on, files are in subfolders.
+                # rglob should find them.
+                # The template is '... [%(id)s].%(ext)s', so we look for the ID.
+                # Sometimes file systems or yt-dlp might behave slightly differently with brackets.
+                
+                # First try explicit bracket match which is most accurate
                 files_found = list(session_dir.rglob(f"*[{video_id}]*"))
+                
+                if not files_found:
+                    # Fallback: search for just the ID, but be careful of partial matches
+                    # YouTube IDs are 11 chars.
+                    all_matches = list(session_dir.rglob(f"*{video_id}*"))
+                    # Filter to ensure it's likely the ID (e.g. at end of name or preceded by space/bracket)
+                    files_found = all_matches
+                    if files_found:
+                        print(f"DEBUG: Found files via fallback for {video_id}: {[f.name for f in files_found]}")
+
+                # Debugging
+                if not files_found:
+                     print(f"DEBUG: No files found for video_id: {video_id} in {session_dir}. Files in dir:")
+                     # List a few files to see what's happening
+                     for i, f in enumerate(session_dir.rglob("*")):
+                         if i < 5: print(f"  {f.name}")
                 
                 json_file = next((f for f in files_found if f.suffix == '.json'), None)
                 sub_file = next((f for f in files_found if f.suffix in ['.vtt', '.srt']), None)
