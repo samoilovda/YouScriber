@@ -117,39 +117,44 @@ def clean_vtt_content(content: str) -> str:
     Cleans WebVTT/SRT content to pure text.
     Removes timestamps, formatting tags, and duplicate lines.
     """
-    # 1. Remove WebVTT header if present
-    content = re.sub(r'WEBVTT.*?\n', '', content, flags=re.DOTALL)
+    # 1. Remove entire WEBVTT header block (everything up to the first blank line).
+    # This also strips metadata lines like 'Kind: captions', 'Language: en'.
+    content = re.sub(r'^WEBVTT\b.*?(?=\n\n)', '', content, flags=re.DOTALL)
 
-    # 2. Remove timestamps (e.g., 00:00:01.500 --> 00:00:03.000)
-    # Flexible regex to catch various time formats
-    content = re.sub(r'\d{2}:\d{2}:\d{2}[\.,]\d{3} --> \d{2}:\d{2}:\d{2}[\.,]\d{3}.*?\n', '', content)
-    content = re.sub(r'\d{2}:\d{2}[\.,]\d{3} --> \d{2}:\d{2}[\.,]\d{3}.*?\n', '', content) # shorter format
+    # 2. Remove timestamp lines (e.g., 00:00:01.500 --> 00:00:03.000 align:start position:0%)
+    # Use re.MULTILINE + $ to correctly match even when the file has no trailing newline.
+    content = re.sub(r'^\d{2}:\d{2}:\d{2}[\.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[\.,]\d{3}.*$', '', content, flags=re.MULTILINE)
+    content = re.sub(r'^\d{2}:\d{2}[\.,]\d{3}\s*-->\s*\d{2}:\d{2}[\.,]\d{3}.*$', '', content, flags=re.MULTILINE)
 
-    # 3. Remove HTML-like tags (e.g., <c.colorE5E5E5>, <00:00:00.609><c>)
+    # 3. Remove inline VTT tags: <c>, </c>, <c.colorXXX>, <00:00:00.000>, etc.
     content = re.sub(r'<[^>]+>', '', content)
 
-    # 4. Remove simple numeric indices often found in SRT
+    # 4. Remove SRT numeric indices (lines that are purely a number)
     content = re.sub(r'^\d+\s*$', '', content, flags=re.MULTILINE)
 
-    # 5. Process line by line to remove duplicates and empty lines
+    # 5. Process line by line: strip, drop empties, and deduplicate rolling-window duplicates.
+    # YouTube auto-subs produce a sliding-window effect where each new cue starts with
+    # the tail of the previous cue. Strategy: if a line starts with the entire previous
+    # line (or vice-versa), drop the shorter/older one so only the longest survives.
     lines = content.splitlines()
     cleaned_lines = []
-    seen_lines = set()
-    last_line = ""
 
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        
-        # Deduplication strategy:
-        # A common issue in auto-subs is the same line appearing purely duplicated
-        # or shifting slightly. We'll do strict previous-line checking.
-        if line == last_line:
-            continue
-        
+
+        if cleaned_lines:
+            prev = cleaned_lines[-1]
+            # Current line is an extension of previous → replace previous with current
+            if line.startswith(prev):
+                cleaned_lines[-1] = line
+                continue
+            # Current line is a subset/repeat of previous → skip it
+            if prev.startswith(line) or line == prev:
+                continue
+
         cleaned_lines.append(line)
-        last_line = line
 
     return "\n".join(cleaned_lines)
 
@@ -163,6 +168,21 @@ class MyLogger:
     def error(self, msg):
         self.errors.append(msg)
 
+def sanitize_description(description: str) -> str:
+    """
+    Strips promo noise from YouTube descriptions: raw URLs, hashtags, and
+    repeated blank lines. Keeps chapter markers and human-readable text.
+    """
+    # Remove raw URLs (http/https and www.)
+    description = re.sub(r'https?://\S+', '', description)
+    description = re.sub(r'www\.\S+', '', description)
+    # Remove hashtags
+    description = re.sub(r'#\w+', '', description)
+    # Collapse 3+ consecutive blank lines into at most 2
+    description = re.sub(r'\n{3,}', '\n\n', description)
+    return description.strip()
+
+
 def format_for_llm(metadata: dict, transcript: str) -> str:
     """
     Formats the final output string for LLM ingestion.
@@ -170,7 +190,7 @@ def format_for_llm(metadata: dict, transcript: str) -> str:
     title = metadata.get('title', 'Unknown Title')
     url = metadata.get('webpage_url', metadata.get('original_url', 'Unknown URL'))
     upload_date = metadata.get('upload_date', 'Unknown Date')
-    description = metadata.get('description', '')
+    description = sanitize_description(metadata.get('description', ''))
 
     # Format date if strictly YYYYMMDD
     if len(upload_date) == 8 and upload_date.isdigit():
@@ -195,7 +215,8 @@ def fetch_playlist_info(urls: list, browser: str = "None") -> list:
     logger = MyLogger()
     flat_opts = {
         'extract_flat': True,
-        'dump_single_json': True,
+        # NOTE: 'dump_single_json' is a CLI-only flag; in the Python API it causes
+        # extract_info() to return None. Do NOT add it here.
         'quiet': True,
         'ignoreerrors': True,
         'logger': logger,
@@ -214,28 +235,46 @@ def fetch_playlist_info(urls: list, browser: str = "None") -> list:
                 if not info:
                     continue
                     
-                if 'entries' in info:
+                if 'entries' in info and info['entries'] is not None:
                     # It's a playlist or channel
                     playlist_title = info.get('title', 'Unknown Playlist')
                     for entry in info['entries']:
                         if entry:
-                            entry['playlist_title'] = playlist_title
+                            # Safely extract only what we need to avoid PyArrow serialization crashes in Streamlit data_editor
+                            safe_entry = {
+                                'title': entry.get('title', 'Unknown Title'),
+                                'id': entry.get('id', ''),
+                                'playlist_title': playlist_title
+                            }
+                            
                             # Ensure we have a valid URL or ID to construct one
                             if not entry.get('url') and entry.get('id'):
-                                entry['url'] = f"https://www.youtube.com/watch?v={entry['id']}"
+                                safe_entry['url'] = f"https://www.youtube.com/watch?v={entry['id']}"
                             elif not entry.get('url') and entry.get('webpage_url'):
-                                entry['url'] = entry['webpage_url']
+                                safe_entry['url'] = entry.get('webpage_url')
+                            else:
+                                safe_entry['url'] = entry.get('url', '')
                                 
-                            video_list.append(entry)
+                            # Only add if we have a valid identifier
+                            if safe_entry['id'] or safe_entry['url']:
+                                video_list.append(safe_entry)
                 else:
                     # Single video
                     # Ensure consistency in keys
+                    safe_entry = {
+                        'title': info.get('title', 'Unknown Title'),
+                        'id': info.get('id', ''),
+                        'playlist_title': info.get('playlist_title', 'Single Video')
+                    }
                     if not info.get('url') and info.get('webpage_url'):
-                        info['url'] = info['webpage_url']
+                        safe_entry['url'] = info.get('webpage_url')
                     elif not info.get('url') and info.get('id'):
-                        info['url'] = f"https://www.youtube.com/watch?v={info['id']}"
+                        safe_entry['url'] = f"https://www.youtube.com/watch?v={info['id']}"
+                    else:
+                        safe_entry['url'] = info.get('url', '')
                         
-                    video_list.append(info)
+                    if safe_entry['id'] or safe_entry['url']:
+                        video_list.append(safe_entry)
             except Exception as e:
                 st.error(f"Error gathering metadata for {url}: {str(e)}")
     
@@ -285,10 +324,10 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
         progress_bar.progress((i) / total_videos, text=f"Processing {i+1}/{total_videos}: {title}")
         
         # Determine the output folder for this specific video
+        # Bug #4 fix: always initialise pl_title to avoid UnboundLocalError
+        pl_title = video_info.get('playlist_title', '')
         video_out_dir = session_dir
-        if group_by_playlist:
-            # Use playlist title from our fetched metadata
-            pl_title = video_info.get('playlist_title', 'Unknown Playlist')
+        if group_by_playlist and pl_title:
             safe_pl_title = "".join([c for c in pl_title if c.isalnum() or c in ' -_']).strip()
             video_out_dir = session_dir / safe_pl_title
         
@@ -317,55 +356,70 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
             # Execute download via CLI
             subprocess.run(cmd, check=False)
             
-            # Find generated files
-            files_found = list(video_out_dir.glob(f"*{video_id}*"))
-            
-            if not files_found:
-                # Alternative search in case of nested dirs or extension issues
-                files_found = list(video_out_dir.rglob(f"*{video_id}*"))
-
+            # Find generated files — first try fast glob, then rglob fallback
+            safe_t = "".join([c for c in title if c.isalnum() or c in ' -_']).strip()
+            if video_id:
+                files_found = list(video_out_dir.glob(f"*{video_id}*"))
                 if not files_found:
-                    st.warning(f"Files not found for {title} ({video_id})")
-                    continue
-                
-                json_file = next((f for f in files_found if f.suffix == '.json'), None)
+                    files_found = list(video_out_dir.rglob(f"*{video_id}*"))
+            else:
+                files_found = list(video_out_dir.glob(f"*{safe_t}*"))
+                if not files_found:
+                    files_found = list(video_out_dir.rglob(f"*{safe_t}*"))
+
+            if not files_found:
+                st.warning(f"Files not found for {title} ({video_id})")
+                continue
+
+            # Bug #3 fix: processing block now runs on ANY successful files_found,
+            # not only when the rglob fallback was needed.
+            json_file = next((f for f in files_found if f.suffix == '.json'), None)
+            # Prefer language-specific subtitle: en first, then ru, then uk
+            sub_file = None
+            for lang in ['en', 'ru', 'uk', '']:
+                lang_suffix = f'.{lang}.vtt' if lang else ''
+                candidates = [f for f in files_found if f.name.endswith(lang_suffix + '.vtt') or
+                                                         (not lang and f.suffix == '.srt')]
+                if candidates:
+                    sub_file = candidates[0]
+                    break
+            if sub_file is None:
                 sub_file = next((f for f in files_found if f.suffix in ['.vtt', '.srt']), None)
 
-                if not json_file:
-                    st.warning(f"Metadata not found for {title}. Skipping.")
-                    continue
-                
-                # Load Metadata
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    meta_data = json.load(f)
+            if not json_file:
+                st.warning(f"Metadata (.info.json) not found for '{title}'. Skipping.")
+                continue
+            
+            # Load Metadata
+            with open(json_file, 'r', encoding='utf-8') as f:
+                meta_data = json.load(f)
 
-                # Load and Clean Transcript
-                transcript_text = ""
-                if sub_file:
-                     with open(sub_file, 'r', encoding='utf-8') as f:
-                        raw_subs = f.read()
-                        transcript_text = clean_vtt_content(raw_subs)
-                else:
-                    transcript_text = "[No subtitles available]"
+            # Load and Clean Transcript
+            if sub_file:
+                with open(sub_file, 'r', encoding='utf-8') as f:
+                    raw_subs = f.read()
+                transcript_text = clean_vtt_content(raw_subs)
+            else:
+                transcript_text = "[No subtitles available]"
 
-                # Format Final Output
-                final_content = format_for_llm(meta_data, transcript_text)
-                
-                # Save Final File
-                output_dir = session_dir / "processed"
-                if group_by_playlist and pl_title:
-                     safe_playlist_title = "".join([c for c in pl_title if c.isalnum() or c in ' -_']).strip()
-                     output_dir = output_dir / safe_playlist_title
-                
-                output_dir.mkdir(parents=True, exist_ok=True)
-                
-                safe_title = "".join([c for c in title if c.isalnum() or c in ' -_']).strip()
-                final_filename = output_dir / f"{safe_title}.txt"
-                
-                with open(final_filename, 'w', encoding='utf-8') as f:
-                    f.write(final_content)
-                
-                processed_files.append(final_filename)
+            # Format Final Output
+            final_content = format_for_llm(meta_data, transcript_text)
+            
+            # Save Final File
+            output_dir = session_dir / "processed"
+            if group_by_playlist and pl_title:
+                safe_playlist_title = "".join([c for c in pl_title if c.isalnum() or c in ' -_']).strip()
+                output_dir = output_dir / safe_playlist_title
+            
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            safe_title = "".join([c for c in title if c.isalnum() or c in ' -_']).strip()
+            final_filename = output_dir / f"{safe_title}.txt"
+            
+            with open(final_filename, 'w', encoding='utf-8') as f:
+                f.write(final_content)
+            
+            processed_files.append(final_filename)
                 
         except Exception as e:
             logger.error(f"Failed to process {title}: {str(e)}")
@@ -403,13 +457,35 @@ def main():
     with tab1:
         st.header("YouTube Downloader & Extractor")
         
+        st.subheader("1. Extract Video Links from Playlists/Channels")
+        st.markdown("Enter playlist or channel URLs to generate a numbered list of video links.")
+        playlist_urls_input = st.text_area("Playlist/Channel URLs (one per line):", height=100, key="playlist_input")
+        if st.button("Extract Links", type="secondary"):
+            if not playlist_urls_input.strip():
+                st.error("Please enter at least one URL.")
+            else:
+                urls = [u.strip() for u in playlist_urls_input.splitlines() if u.strip()]
+                with st.spinner("Fetching playlist info..."):
+                    videos = fetch_playlist_info(urls, browser=browser_choice)
+                    
+                if videos:
+                    st.success(f"Found {len(videos)} videos.")
+                    links_text = "\n".join([f"{i+1}. {v.get('url', 'Unknown URL')}" for i, v in enumerate(videos)])
+                    st.text_area("Extracted Links:", value=links_text, height=200)
+                else:
+                    st.warning("No videos found or unable to fetch metadata.")
+
+        st.divider()
+
+        st.subheader("2. Download Subtitles from Video Links")
+        st.markdown("Enter individual video links. You can also paste the numbered list from above.")
         col1, col2 = st.columns([0.8, 0.2])
         with col1:
-             urls_input = st.text_area("Enter YouTube URLs (one per line):", height=100)
+             urls_input = st.text_area("Enter YouTube Video URLs (one per line):", height=150, key="video_input")
         with col2:
              st.write("")
              st.write("")
-             if st.button("Clear/Reset", type="secondary"):
+             if st.button("Clear/Reset", type="secondary", key="reset_videos"):
                  if 'video_list' in st.session_state:
                      del st.session_state['video_list']
                  st.rerun()
@@ -424,8 +500,10 @@ def main():
             if not urls_input.strip():
                 st.error("Please enter at least one URL.")
             else:
-                urls = [u.strip() for u in urls_input.splitlines() if u.strip()]
-                with st.spinner("Fetching playlist info..."):
+                # Clean numbered lists if pasted from step 1
+                raw_lines = [u.strip() for u in urls_input.splitlines() if u.strip()]
+                urls = [re.sub(r'^\d+\.\s*', '', line) for line in raw_lines]
+                with st.spinner("Fetching video info..."):
                     videos = fetch_playlist_info(urls, browser=browser_choice)
                     
                 if videos:
@@ -465,7 +543,7 @@ def main():
                 },
                 disabled=["title", "url", "playlist_title", "id", "entries"],
                 hide_index=True,
-                use_container_width=True,
+                use_container_width='stretch',
                 key="video_editor"
             )
             
