@@ -14,6 +14,20 @@
     pip install -r requirements.txt
     ```
 
+### YouTube Subtitles Failing (2026 PO Token Rollout)
+If subtitle extraction starts failing with bot/403/empty subtitle behavior:
+
+1. Update `yt-dlp` first:
+   ```bash
+   python -m pip install -U --pre "yt-dlp[default]"
+   ```
+2. Use browser cookies only when needed (private/age-restricted/member content), and keep request rate low.
+3. If your network/account is heavily challenged, set custom extractor args via env var before launching the app:
+   ```bash
+   export YOUSCRIBER_YT_EXTRACTOR_ARGS='player_client=mweb;fetch_pot=auto'
+   ```
+4. For strict PO-token environments, install a PO-token provider plugin and pass its recommended extractor args.
+
 ## Running the App
 
 Run the following command in your terminal:

@@ -8,10 +8,16 @@ import json
 import shutil
 import traceback
 import subprocess
+import os
+import sys
+import fnmatch
 
 # --- Configuration & Setup ---
 
 BASE_TEMP_DIR = pathlib.Path(tempfile.gettempdir()) / "youscriber"
+DEFAULT_SUB_LANGS = os.getenv("YOUSCRIBER_SUB_LANGS", "en.*,en")
+SECONDARY_SUB_LANGS = os.getenv("YOUSCRIBER_SECONDARY_SUB_LANGS", "ru.*,ru,uk.*,uk")
+FALLBACK_SUB_LANGS = "all,-live_chat"
 
 def ensure_session_dir(session_id: str) -> pathlib.Path:
     session_dir = BASE_TEMP_DIR / session_id
@@ -159,6 +165,14 @@ def fetch_playlist_info(urls: list, browser: str = "None", status_callback=None,
         'extract_flat': True,
         'quiet': True,
         'ignoreerrors': True,
+        'extractor_retries': 5,
+        'remote_components': ['ejs:github'],
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android_vr'],
+                'fetch_pot': ['auto'],
+            }
+        },
         'logger': logger,
     }
 
@@ -167,7 +181,6 @@ def fetch_playlist_info(urls: list, browser: str = "None", status_callback=None,
             flat_opts['cookiefile'] = browser
         else:
             flat_opts['cookiesfrombrowser'] = (browser,)
-        flat_opts['remote_components'] = ['ejs:github']
 
     video_list = []
     
@@ -232,6 +245,29 @@ class RateLimitError(Exception):
     """Raised when yt-dlp hits a 429 Too Many Requests error."""
     pass
 
+
+class TransientNetworkError(Exception):
+    """Raised for temporary network resolution/transport failures."""
+    pass
+
+
+class BotCheckError(Exception):
+    """Raised when YouTube asks to confirm the requester is not a bot."""
+    pass
+
+
+class PoTokenError(Exception):
+    """Raised when extraction likely failed due to PO token enforcement."""
+    pass
+
+
+class YtDlpCommandError(Exception):
+    """Raised for non-zero yt-dlp command failures."""
+
+    def __init__(self, message: str, output: str = ""):
+        super().__init__(message)
+        self.output = output
+
 def _get_cookie_args(browser: str) -> list:
     """Build safe cookie CLI arguments. Handles .txt files and named browsers."""
     if not browser or browser == "None":
@@ -240,37 +276,90 @@ def _get_cookie_args(browser: str) -> list:
         return ["--cookies", browser]
     return ["--cookies-from-browser", browser]
 
+def _is_retryable_network_error(output: str) -> bool:
+    markers = (
+        "failed to resolve",
+        "temporary failure in name resolution",
+        "timed out",
+        "connection reset",
+        "network is unreachable",
+        "transporterror",
+    )
+    text = output.lower()
+    return any(marker in text for marker in markers)
+
+
+def _brief_ydlp_error(output: str) -> str:
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ERROR:") or stripped.startswith("WARNING:"):
+            return stripped
+    return "yt-dlp failed without a detailed error line."
+
+
 def _run_ydlp(cmd_args: list, cwd: pathlib.Path | None = None) -> int:
-    """Run yt-dlp as a subprocess and raise RateLimitError on HTTP 429."""
-    import subprocess
+    """Run yt-dlp as a subprocess and surface key anti-bot failures as typed exceptions."""
     result = subprocess.run(
-        ["python", "-m", "yt_dlp"] + cmd_args,
+        [sys.executable, "-m", "yt_dlp"] + cmd_args,
         capture_output=True,
         text=True,
         cwd=cwd,
     )
-    # Surface 429 so tenacity can retry
+
     combined = result.stdout + result.stderr
-    if "HTTP Error 429" in combined:
-        raise RateLimitError("YouTube returned HTTP 429: Too Many Requests")
+
     # Print to terminal so the user can see live progress
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, end="")
+
+    lower = combined.lower()
+    if "http error 429" in lower or "too many requests" in lower:
+        raise RateLimitError("YouTube returned HTTP 429: Too Many Requests")
+    if _is_retryable_network_error(combined):
+        raise TransientNetworkError(_brief_ydlp_error(combined))
+    if "sign in to confirm you’re not a bot" in lower or "sign in to confirm you're not a bot" in lower:
+        raise BotCheckError(_brief_ydlp_error(combined))
+    if "po token" in lower and "youtube" in lower:
+        raise PoTokenError(_brief_ydlp_error(combined))
+    if "http error 403" in lower and "youtube" in lower:
+        raise PoTokenError(_brief_ydlp_error(combined))
+    if result.returncode != 0:
+        raise YtDlpCommandError(_brief_ydlp_error(combined), combined)
+
     return result.returncode
 
 @retry(
-    retry=retry_if_exception_type(RateLimitError),
-    wait=wait_exponential(multiplier=1, min=30, max=120),  # 30s → 60s → 120s back-off
+    retry=retry_if_exception_type((RateLimitError, TransientNetworkError)),
+    wait=wait_exponential(multiplier=1, min=15, max=90),  # 15s → 30s → 60s → 90s back-off
     stop=stop_after_attempt(4),
     reraise=True,
 )
 def _run_with_retry(cmd_args: list, cwd: pathlib.Path | None = None):
-    """Wrap _run_ydlp with exponential back-off on 429 errors."""
+    """Wrap _run_ydlp with exponential back-off on 429 and transient network failures."""
     _run_ydlp(cmd_args, cwd)
 
-def _build_download_cmd(video_url: str, out_dir: pathlib.Path, browser: str, with_subs: bool = True) -> list:
+def _resolve_extractor_args(player_client: str) -> str:
+    """
+    Build extractor args.
+    If YOUSCRIBER_YT_EXTRACTOR_ARGS is set, it is used verbatim (without `youtube:` prefix).
+    """
+    env_override = os.getenv("YOUSCRIBER_YT_EXTRACTOR_ARGS", "").strip()
+    if env_override:
+        return env_override
+    return f"player_client={player_client};fetch_pot=auto"
+
+
+def _build_download_cmd(
+    video_url: str,
+    out_dir: pathlib.Path,
+    browser: str,
+    with_subs: bool = True,
+    player_client: str = "android_vr",
+    sub_langs: str = DEFAULT_SUB_LANGS,
+    impersonate_target: str = "",
+) -> list:
     """Construct the yt-dlp CLI args for retrieving metadata (and optionally subtitles)."""
     # Randomize sleep per video so we look human
     sleep_min = str(random.randint(2, 4))    # 2–4 s between requests
@@ -278,7 +367,9 @@ def _build_download_cmd(video_url: str, out_dir: pathlib.Path, browser: str, wit
     sub_sleep  = str(random.randint(2, 5))   # 2–5 s between subtitle tracks
 
     args = [
-        "--impersonate", "chrome",            # TLS fingerprint spoofing
+        "--extractor-retries", "5",
+        "--remote-components", "ejs:github",
+        "--extractor-args", f"youtube:{_resolve_extractor_args(player_client)}",
         "--min-sleep-interval", sleep_min,
         "--max-sleep-interval", sleep_max,
         "--retries", "10",                    # network retry on transient errors
@@ -291,17 +382,97 @@ def _build_download_cmd(video_url: str, out_dir: pathlib.Path, browser: str, wit
         "-o", str(out_dir / "%(title)s [%(id)s].%(ext)s"),
     ]
 
+    if impersonate_target:
+        args += ["--impersonate", impersonate_target]
+
     if with_subs:
         args += [
             "--write-sub",
             "--write-auto-sub",
-            "--sub-langs", "en,ru,uk",
+            "--sub-langs", sub_langs,
             "--sleep-subtitles", sub_sleep,
         ]
 
     args += _get_cookie_args(browser)
     args.append(video_url)
     return args
+
+
+def _subtitle_attempt_plan() -> list[dict]:
+    """
+    Ordered from safest/least brittle to more permissive fallbacks.
+    Each attempt controls player client, subtitle language pattern and impersonation.
+    """
+    env_clients = os.getenv("YOUSCRIBER_YT_PLAYER_CLIENT", "").strip()
+    if env_clients:
+        return [
+            {"label": f"custom clients ({env_clients})", "player_client": env_clients, "sub_langs": DEFAULT_SUB_LANGS, "impersonate": ""},
+            {"label": f"custom clients ({env_clients}) + secondary langs", "player_client": env_clients, "sub_langs": SECONDARY_SUB_LANGS, "impersonate": ""},
+            {"label": f"custom clients ({env_clients}) + all langs", "player_client": env_clients, "sub_langs": FALLBACK_SUB_LANGS, "impersonate": ""},
+        ]
+
+    return [
+        {"label": "android_vr english", "player_client": "android_vr", "sub_langs": DEFAULT_SUB_LANGS, "impersonate": ""},
+        {"label": "android_vr secondary langs", "player_client": "android_vr", "sub_langs": SECONDARY_SUB_LANGS, "impersonate": ""},
+        {"label": "android_vr all langs", "player_client": "android_vr", "sub_langs": FALLBACK_SUB_LANGS, "impersonate": ""},
+        {"label": "android_vr,tv english", "player_client": "android_vr,tv", "sub_langs": DEFAULT_SUB_LANGS, "impersonate": ""},
+        {"label": "android_vr,web_safari english", "player_client": "android_vr,web_safari", "sub_langs": DEFAULT_SUB_LANGS, "impersonate": "chrome"},
+    ]
+
+
+def _find_downloaded_files(video_out_dir: pathlib.Path, video_id: str, title: str) -> list[pathlib.Path]:
+    files_found = list(video_out_dir.glob(f"*{video_id}*")) if video_id else []
+    if files_found:
+        return files_found
+
+    safe_t = "".join(c for c in title if c.isalnum() or c in " -_").strip()
+    if safe_t:
+        files_found = list(video_out_dir.glob(f"*{safe_t}*"))
+    return files_found
+
+
+def _pick_best_sub_file(files_found: list[pathlib.Path]) -> pathlib.Path | None:
+    subtitle_files = [f for f in files_found if f.suffix in (".vtt", ".srt")]
+    if not subtitle_files:
+        return None
+
+    subtitle_files = [f for f in subtitle_files if ".live_chat." not in f.name]
+    if not subtitle_files:
+        return None
+
+    ranked_patterns = (
+        "*.en-orig.*",
+        "*.en.*",
+        "*.ru.*",
+        "*.uk.*",
+        "*.vtt",
+        "*.srt",
+    )
+    for pattern in ranked_patterns:
+        for f in subtitle_files:
+            if fnmatch.fnmatch(f.name.lower(), pattern):
+                return f
+    return subtitle_files[0]
+
+
+def _has_usable_subtitles(sub_file: pathlib.Path | None) -> bool:
+    if not sub_file or not sub_file.exists():
+        return False
+    if sub_file.stat().st_size < 64:
+        return False
+    try:
+        raw = sub_file.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    cleaned = clean_vtt_content(raw).strip()
+    return len(cleaned) > 25
+
+
+def _pick_info_json(files_found: list[pathlib.Path]) -> pathlib.Path | None:
+    info_json = next((f for f in files_found if f.name.endswith(".info.json")), None)
+    if info_json:
+        return info_json
+    return next((f for f in files_found if f.suffix == ".json"), None)
 
 
 def download_videos(video_list: list, group_by_playlist: bool, session_id: str,
@@ -349,38 +520,73 @@ def download_videos(video_list: list, group_by_playlist: bool, session_id: str,
                 video_out_dir = video_out_dir / safe_pl
         video_out_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Try full download (subs + metadata) with exponential back-off ---
-        try:
-            cmd_args = _build_download_cmd(url, video_out_dir, browser, with_subs=True)
-            _run_with_retry(cmd_args)
-        except RateLimitError:
-            if error_callback:
-                error_callback(f"429 persisted after retries for '{title}'. Falling back to metadata-only.")
-        except Exception as e:
-            if error_callback:
-                error_callback(f"Unexpected error for '{title}': {e}")
+        # --- Try full download (subs + metadata) with multiple client/language fallbacks ---
+        subtitle_download_succeeded = False
+        subtitle_attempt_errors = []
+        attempts = _subtitle_attempt_plan()
+        for attempt_no, attempt in enumerate(attempts, start=1):
+            if status_callback:
+                status_callback(
+                    f"Attempt {attempt_no}/{len(attempts)} for '{title}': {attempt['label']}"
+                )
+            try:
+                cmd_args = _build_download_cmd(
+                    url,
+                    video_out_dir,
+                    browser,
+                    with_subs=True,
+                    player_client=attempt["player_client"],
+                    sub_langs=attempt["sub_langs"],
+                    impersonate_target=attempt["impersonate"],
+                )
+                _run_with_retry(cmd_args)
+            except RateLimitError as e:
+                subtitle_attempt_errors.append(str(e))
+                continue
+            except (TransientNetworkError, BotCheckError, PoTokenError, YtDlpCommandError) as e:
+                subtitle_attempt_errors.append(str(e))
+                continue
+            except Exception as e:
+                subtitle_attempt_errors.append(str(e))
+                continue
+
+            files_found = _find_downloaded_files(video_out_dir, video_id, title)
+            sub_file = _pick_best_sub_file(files_found)
+            if _has_usable_subtitles(sub_file):
+                subtitle_download_succeeded = True
+                break
+            subtitle_attempt_errors.append(f"Downloaded subtitle file was missing/empty on attempt '{attempt['label']}'")
+
+        if not subtitle_download_succeeded and error_callback and subtitle_attempt_errors:
+            error_callback(
+                f"Subtitle extraction failed for '{title}' after {len(subtitle_attempt_errors)} attempts. "
+                f"Last error: {subtitle_attempt_errors[-1]}"
+            )
 
         # --- Find downloaded files ---
-        files_found = list(video_out_dir.glob(f"*{video_id}*")) if video_id else []
-        if not files_found:
-            safe_t = "".join(c for c in title if c.isalnum() or c in ' -_').strip()
-            files_found = list(video_out_dir.glob(f"*{safe_t}*"))
-
-        json_file = next((f for f in files_found if f.suffix == '.json'), None)
+        files_found = _find_downloaded_files(video_out_dir, video_id, title)
+        json_file = _pick_info_json(files_found)
 
         # --- Metadata-only fallback if JSON is missing after 429 ---
         if not json_file:
             if status_callback:
                 status_callback(f"Retrying metadata-only for '{title}'…")
             try:
-                fallback_args = _build_download_cmd(url, video_out_dir, browser, with_subs=False)
+                fallback_args = _build_download_cmd(
+                    url,
+                    video_out_dir,
+                    browser,
+                    with_subs=False,
+                    player_client="android_vr",
+                    impersonate_target="",
+                )
                 _run_with_retry(fallback_args)
             except Exception as e:
                 if error_callback:
                     error_callback(f"Fallback also failed for '{title}': {e}")
 
-            files_found = list(video_out_dir.glob(f"*{video_id}*")) if video_id else []
-            json_file   = next((f for f in files_found if f.suffix == '.json'), None)
+            files_found = _find_downloaded_files(video_out_dir, video_id, title)
+            json_file   = _pick_info_json(files_found)
 
         if not json_file:
             if error_callback:
@@ -396,20 +602,11 @@ def download_videos(video_list: list, group_by_playlist: bool, session_id: str,
                 error_callback(f"Failed to parse JSON for '{title}': {e}")
             continue
 
-        # --- Find best available subtitle (en > ru > uk > any) ---
-        sub_file = None
-        for lang in ('en', 'ru', 'uk', ''):
-            suffix = f'.{lang}.vtt' if lang else ''
-            candidates = [f for f in files_found if f.name.endswith(suffix) or
-                                                     f.name.endswith(suffix.replace('.vtt', '.srt'))]
-            if candidates:
-                sub_file = candidates[0]
-                break
-        if sub_file is None:
-            sub_file = next((f for f in files_found if f.suffix in ('.vtt', '.srt')), None)
+        # --- Find best available subtitle (en-orig > en > ru > uk > any) ---
+        sub_file = _pick_best_sub_file(files_found)
 
-        if sub_file:
-            with open(sub_file, 'r', encoding='utf-8') as f:
+        if _has_usable_subtitles(sub_file):
+            with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
                 transcript_text = clean_vtt_content(f.read())
         else:
             transcript_text = "[No subtitles available — blocked by YouTube or not uploaded by creator]"

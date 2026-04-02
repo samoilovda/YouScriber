@@ -11,6 +11,8 @@ import time
 import traceback
 import uuid
 import subprocess
+import sys
+import fnmatch
 
 # --- Configuration & Setup ---
 st.set_page_config(
@@ -333,28 +335,51 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
         
         video_out_dir.mkdir(parents=True, exist_ok=True)
         
-        # Build options for THIS video
-        # We'll use subprocess to run the CLI which we've verified works better for some reason
-        cmd = [
-            "yt-dlp",
-            "--skip-download",
-            "--write-sub",
-            "--write-auto-sub",
-            "--sub-langs", "en,ru,uk",
-            "--write-info-json",
-            "--no-warnings",
-            "--quiet",
-            "--remote-components", "ejs:github",
-            "-o", str(video_out_dir / '%(title)s [%(id)s].%(ext)s'),
-            url
-        ]
-        
-        if browser and browser != "None":
-            cmd.extend(["--cookies-from-browser", browser])
-            
         try:
-            # Execute download via CLI
-            subprocess.run(cmd, check=False)
+            attempt_plan = [
+                ("android_vr", "en.*,en", ""),
+                ("android_vr", "ru.*,ru,uk.*,uk", ""),
+                ("android_vr", "all,-live_chat", ""),
+                ("android_vr,web_safari", "en.*,en", "chrome"),
+            ]
+
+            last_error = ""
+            for attempt_no, (player_client, sub_langs, impersonate_target) in enumerate(attempt_plan, start=1):
+                status_text.text(
+                    f"Attempt {attempt_no}/{len(attempt_plan)} for '{title}' "
+                    f"({player_client}, sub-langs={sub_langs})"
+                )
+                cmd = [
+                    sys.executable, "-m", "yt_dlp",
+                    "--skip-download",
+                    "--write-sub",
+                    "--write-auto-sub",
+                    "--sub-langs", sub_langs,
+                    "--write-info-json",
+                    "--ignore-errors",
+                    "--no-abort-on-error",
+                    "--extractor-retries", "5",
+                    "--extractor-args", f"youtube:player_client={player_client};fetch_pot=auto",
+                    "--remote-components", "ejs:github",
+                    "--sleep-subtitles", "2",
+                    "-o", str(video_out_dir / '%(title)s [%(id)s].%(ext)s'),
+                    url
+                ]
+                if impersonate_target:
+                    cmd.extend(["--impersonate", impersonate_target])
+                if browser and browser != "None":
+                    cmd.extend(["--cookies-from-browser", browser])
+
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                combined = (result.stdout or "") + (result.stderr or "")
+                if result.returncode == 0:
+                    break
+
+                lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+                important = next((ln for ln in lines if ln.startswith("ERROR:") or ln.startswith("WARNING:")), "")
+                last_error = important or f"yt-dlp exited with code {result.returncode}"
+            else:
+                st.warning(f"Subtitle download failed for '{title}'. Last error: {last_error or 'Unknown'}")
             
             # Find generated files — first try fast glob, then rglob fallback
             safe_t = "".join([c for c in title if c.isalnum() or c in ' -_']).strip()
@@ -373,18 +398,18 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
 
             # Bug #3 fix: processing block now runs on ANY successful files_found,
             # not only when the rglob fallback was needed.
-            json_file = next((f for f in files_found if f.suffix == '.json'), None)
-            # Prefer language-specific subtitle: en first, then ru, then uk
+            json_file = next((f for f in files_found if f.name.endswith('.info.json')), None)
+            if json_file is None:
+                json_file = next((f for f in files_found if f.suffix == '.json'), None)
+
+            subtitle_files = [f for f in files_found if f.suffix in ['.vtt', '.srt'] and '.live_chat.' not in f.name]
+            ranked_patterns = ['*.en-orig.*', '*.en.*', '*.ru.*', '*.uk.*', '*.vtt', '*.srt']
             sub_file = None
-            for lang in ['en', 'ru', 'uk', '']:
-                lang_suffix = f'.{lang}.vtt' if lang else ''
-                candidates = [f for f in files_found if f.name.endswith(lang_suffix + '.vtt') or
-                                                         (not lang and f.suffix == '.srt')]
-                if candidates:
-                    sub_file = candidates[0]
+            for pattern in ranked_patterns:
+                match = next((f for f in subtitle_files if fnmatch.fnmatch(f.name.lower(), pattern)), None)
+                if match:
+                    sub_file = match
                     break
-            if sub_file is None:
-                sub_file = next((f for f in files_found if f.suffix in ['.vtt', '.srt']), None)
 
             if not json_file:
                 st.warning(f"Metadata (.info.json) not found for '{title}'. Skipping.")
@@ -396,9 +421,10 @@ def download_videos(video_list: list, group_by_playlist: bool, progress_bar, sta
 
             # Load and Clean Transcript
             if sub_file:
-                with open(sub_file, 'r', encoding='utf-8') as f:
+                with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
                     raw_subs = f.read()
-                transcript_text = clean_vtt_content(raw_subs)
+                cleaned = clean_vtt_content(raw_subs).strip()
+                transcript_text = cleaned if cleaned else "[No subtitles available]"
             else:
                 transcript_text = "[No subtitles available]"
 
