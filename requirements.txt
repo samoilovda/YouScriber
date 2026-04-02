@@ -1,3 +1,17 @@
-customtkinter
-yt-dlp
-watchdog
+# YouScriber - Dependencies
+
+# Core dependencies
+yt-dlp>=2026.1.0
+tenacity>=8.2.0
+
+# Web interface
+streamlit>=1.28.0
+
+# Desktop interface
+customtkinter>=5.2.2
+
+# Build tools
+pyinstaller>=6.3.0
+
+# Optional but recommended
+ffmpeg-python>=0.2.0
