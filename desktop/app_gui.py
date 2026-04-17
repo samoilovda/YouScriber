@@ -52,7 +52,7 @@ class YouScriberApp(ctk.CTk):
         self.fetched_videos = []
         self.excluded_videos = []
         self.processed_files = []
-        self.browser = "safari"
+        self.browser = "None"
         self.player_client = "android_vr"
         self.group_by_playlist = True
         self.merge_strategy = "No Merge"
@@ -127,7 +127,7 @@ class YouScriberApp(ctk.CTk):
         
         # Browser selection
         browser_var = ctk.StringVar(value=self.browser)
-        self.browser_combo = ctk.CTkComboBox(col_frame, values=["safari", "chrome", "firefox", "edge"], 
+        self.browser_combo = ctk.CTkComboBox(col_frame, values=["None", "safari", "chrome", "firefox", "edge"], 
                                              variable=browser_var, width=150)
         self.browser_combo.pack(side="left", padx=(0, 10))
         
@@ -261,6 +261,10 @@ class YouScriberApp(ctk.CTk):
         if not self.url_entry.get().strip():
             self._add_log("⚠️ Please enter at least one YouTube URL.")
             return
+
+        # Pull current selections from UI controls before launching worker thread.
+        self.browser = self.browser_combo.get()
+        self.player_client = self.player_combo.get()
         
         urls = [url.strip() for url in self.url_entry.get().strip().split('\n') 
                 if url.strip() and 'youtube.com' in url]
@@ -330,6 +334,11 @@ class YouScriberApp(ctk.CTk):
         if not selected:
             self._add_log("⚠️ Please select at least one video to harvest.")
             return
+
+        # Pull current selections from UI controls before launching worker thread.
+        self.browser = self.browser_combo.get()
+        self.player_client = self.player_combo.get()
+        self.group_by_playlist = self.group_var.get()
         
         self.start_btn.configure(state="disabled")
         self._add_log(f"🌱 Starting to harvest subtitles from {len(selected)} video(s)...")

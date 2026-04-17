@@ -61,18 +61,18 @@ def clear_session_dir(session_id: str):
 # ANTI-BAN YOUTUBE EXTRACTION CONFIGURATION
 # =============================================================================
 
-def get_yt_dlp_opts(browser: str = "safari", player_client: str = "android_vr",
+def get_yt_dlp_opts(browser: str = "None", player_client: str = "android_vr",
                     sub_langs: str = DEFAULT_SUB_LANGS, impersonate_target: str = "") -> dict:
     """
     Get yt-dlp options with production-level anti-ban configuration.
     
     CRITICAL ANTI-BAN SETTINGS:
-    - cookiesfrombrowser: Uses Safari cookies to bypass bot detection
+    - cookiesfrombrowser: Uses selected browser cookies to bypass bot detection
     - sleep_interval_requests: Randomized 3-8 second delay between requests
     - min_sleep / max_sleep: Range for exponential backoff
     
     Args:
-        browser: Browser name for cookie extraction (default: 'safari')
+        browser: Browser name for cookie extraction (default: 'None' to disable)
         player_client: Player client to impersonate (android_vr, web_safari, etc.)
         sub_langs: Subtitle language pattern
         impersonate_target: Target browser for impersonation
@@ -236,14 +236,14 @@ def format_for_llm(metadata: dict, transcript: str) -> str:
 # YOUTUBE VIDEO LIST EXTRACTION
 # =============================================================================
 
-def fetch_video_list(urls: list, browser: str = "safari", player_client: str = "android_vr",
+def fetch_video_list(urls: list, browser: str = "None", player_client: str = "android_vr",
                      progress_callback=None, error_callback=None) -> list:
     """
     Fetch metadata for a list of YouTube URLs (videos, playlists, or channels).
     
     Args:
         urls: List of YouTube URLs to fetch
-        browser: Browser name for cookie extraction (default: 'safari')
+        browser: Browser name for cookie extraction (default: 'None' to disable)
         player_client: Player client to impersonate
         progress_callback: Callback(status_text, percentage) for progress updates
         error_callback: Callback(status_text, error_message) for error updates
@@ -578,7 +578,7 @@ def _pick_info_json(files_found: list) -> pathlib.Path | None:
     return next((f for f in files_found if f.suffix == ".json"), None)
 
 
-def download_video_subtitles(url: str, session_id: str, browser: str = "safari",
+def download_video_subtitles(url: str, session_id: str, browser: str = "None",
                               player_client: str = "android_vr", sub_langs: str = DEFAULT_SUB_LANGS,
                               group_by_playlist: bool = True, progress_callback=None,
                               error_callback=None) -> list:
@@ -591,7 +591,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "safari",
     Args:
         url: YouTube video URL
         session_id: Session directory identifier
-        browser: Browser for cookie extraction (default: 'safari')
+        browser: Browser for cookie extraction (default: 'None' to disable)
         player_client: Player client to impersonate (default: 'android_vr')
         sub_langs: Subtitle language pattern (default: DEFAULT_SUB_LANGS)
         group_by_playlist: Whether to group output by playlist/channel

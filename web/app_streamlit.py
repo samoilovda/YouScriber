@@ -45,7 +45,7 @@ def init_session_state():
     if 'merge_strategy' not in st.session_state:
         st.session_state['merge_strategy'] = 'No Merge'
     if 'browser' not in st.session_state:
-        st.session_state['browser'] = 'safari'
+        st.session_state['browser'] = 'None'
     if 'player_client' not in st.session_state:
         st.session_state['player_client'] = 'android_vr'
     if 'session_id' not in st.session_state:
@@ -107,9 +107,9 @@ def youtube_import_tab():
     
     with col2:
         # Browser selection dropdown
-        browsers = ['safari', 'chrome', 'firefox', 'edge']
+        browsers = ['None', 'safari', 'chrome', 'firefox', 'edge']
         selected_browser = st.selectbox(
-            "Browser Cookies:",
+            "Browser Cookies (optional):",
             browsers,
             index=browsers.index(st.session_state['browser'])
         )

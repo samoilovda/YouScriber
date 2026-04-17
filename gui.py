@@ -89,7 +89,7 @@ class App(ctk.CTk):
         # Browser selection
         browser_frame = ctk.CTkFrame(tab)
         browser_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-        ctk.CTkLabel(browser_frame, text="Browser Cookies:").pack(side="left", padx=10)
+        ctk.CTkLabel(browser_frame, text="Browser Cookies (optional):").pack(side="left", padx=10)
         
         self.browser_var = ctk.StringVar(value="None")
         browsers = ["None", "chrome", "firefox", "safari", "edge", "opera", "vivaldi"]

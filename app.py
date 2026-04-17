@@ -467,9 +467,9 @@ def main():
     st.sidebar.title("Available Settings")
     
     st.sidebar.markdown("### YouTube Bot Bypass")
-    st.sidebar.info("If you get 'Sign in to confirm you’re not a bot', select your browser below to use its cookies.")
+    st.sidebar.info("If you get 'Sign in to confirm you’re not a bot', you can optionally select a browser to use its cookies.")
     browser_options = ["None", "chrome", "firefox", "safari", "edge", "opera", "vivaldi"]
-    browser_choice = st.sidebar.selectbox("Cookies from Browser:", browser_options, index=0)
+    browser_choice = st.sidebar.selectbox("Cookies from Browser (optional):", browser_options, index=0)
     
     # merge_options in Export section now
     
