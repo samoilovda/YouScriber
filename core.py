@@ -133,18 +133,25 @@ class CallbackLogger:
     
     def debug(self, msg):
         pass
+
+    def _emit_status(self, msg):
+        """Emit a status message while tolerating 1-arg or 2-arg callbacks."""
+        if not self.status_callback:
+            return
+        try:
+            self.status_callback(msg, 0.0)
+        except TypeError:
+            self.status_callback(msg)
     
     def warning(self, msg):
-        if self.status_callback:
-            self.status_callback(msg)
+        self._emit_status(msg)
     
     def error(self, msg):
         if self.error_callback:
             self.error_callback(msg)
     
     def info(self, msg):
-        if self.status_callback:
-            self.status_callback(msg)
+        self._emit_status(msg)
 
 
 def clean_vtt_content(content: str) -> str:
@@ -237,7 +244,7 @@ def format_for_llm(metadata: dict, transcript: str) -> str:
 # =============================================================================
 
 def fetch_video_list(urls: list, browser: str = "None", player_client: str = "android_vr",
-                     progress_callback=None, error_callback=None) -> list:
+                     progress_callback=None, error_callback=None, cancel_event=None) -> list:
     """
     Fetch metadata for a list of YouTube URLs (videos, playlists, or channels).
     
@@ -283,6 +290,10 @@ def fetch_video_list(urls: list, browser: str = "None", player_client: str = "an
     
     with yt_dlp.YoutubeDL(flat_opts) as ydl:
         for url in urls:
+            if cancel_event and cancel_event.is_set():
+                if error_callback:
+                    error_callback("Fetch cancelled by user.")
+                break
             try:
                 info = ydl.extract_info(url, download=False)
                 if not info:
@@ -293,6 +304,8 @@ def fetch_video_list(urls: list, browser: str = "None", player_client: str = "an
                     channel_name = info.get('uploader', info.get('uploader_id', info.get('channel', 'Unknown Channel')))
                     
                     for entry in info['entries']:
+                        if cancel_event and cancel_event.is_set():
+                            break
                         if entry:
                             safe_entry = {
                                 'title': entry.get('title', 'Unknown Title'),
@@ -366,6 +379,11 @@ class YtDlpCommandError(Exception):
         self.output = output
 
 
+class OperationCancelled(Exception):
+    """Raised when the current operation is cancelled by user request."""
+    pass
+
+
 # =============================================================================
 # YOUTUBE DOWNLOAD WITH ANTI-BAN MEASURES
 # =============================================================================
@@ -376,7 +394,7 @@ class YtDlpCommandError(Exception):
     stop=stop_after_attempt(4),
     reraise=True,
 )
-def _run_ydlp_with_retry(cmd_args: list, cwd: pathlib.Path | None = None):
+def _run_ydlp_with_retry(cmd_args: list, cwd: pathlib.Path | None = None, cancel_event=None):
     """
     Wrap yt-dlp subprocess call with exponential back-off on rate limits.
     
@@ -384,20 +402,32 @@ def _run_ydlp_with_retry(cmd_args: list, cwd: pathlib.Path | None = None):
         cmd_args: Command line arguments for yt-dlp
         cwd: Working directory (optional)
     """
-    result = subprocess.run(
-        [sys.executable, "-m", "yt_dlp"] + cmd_args,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
-    
-    combined = result.stdout + result.stderr
-    
-    # Print to terminal so the user can see live progress
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="")
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="ignore") as output_stream:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "yt_dlp"] + cmd_args,
+            stdout=output_stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=cwd,
+        )
+
+        while proc.poll() is None:
+            if cancel_event and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                raise OperationCancelled("yt-dlp run cancelled by user.")
+            time.sleep(0.25)
+
+        output_stream.flush()
+        output_stream.seek(0)
+        combined = output_stream.read()
+
+    if combined:
+        print(combined, end="")
     
     lower = combined.lower()
     if "http error 429" in lower or "too many requests" in lower:
@@ -410,10 +440,10 @@ def _run_ydlp_with_retry(cmd_args: list, cwd: pathlib.Path | None = None):
         raise PoTokenError(_brief_ydlp_error(combined))
     if "http error 403" in lower and "youtube" in lower:
         raise PoTokenError(_brief_ydlp_error(combined))
-    if result.returncode != 0:
+    if proc.returncode != 0:
         raise YtDlpCommandError(_brief_ydlp_error(combined), combined)
     
-    return result.returncode
+    return proc.returncode
 
 
 def _is_retryable_network_error(output: str) -> bool:
@@ -514,8 +544,8 @@ def _subtitle_attempt_plan(player_client: str = "android_vr", sub_langs: str = D
         {"label": f"{player_client} english", "player_client": player_client, "sub_langs": sub_langs, "impersonate": ""},
         {"label": f"{player_client} secondary langs", "player_client": player_client, "sub_langs": SECONDARY_SUB_LANGS, "impersonate": ""},
         {"label": f"{player_client} all langs", "player_client": player_client, "sub_langs": FALLBACK_SUB_LANGS, "impersonate": ""},
-        {"label": f"{player_client,tv} english", "player_client": f"{player_client},tv", "sub_langs": sub_langs, "impersonate": ""},
-        {"label": f"{player_client,tv} english (chrome)", "player_client": f"{player_client},tv", "sub_langs": sub_langs, "impersonate": "chrome"},
+        {"label": f"{player_client},tv english", "player_client": f"{player_client},tv", "sub_langs": sub_langs, "impersonate": ""},
+        {"label": f"{player_client},tv english (chrome)", "player_client": f"{player_client},tv", "sub_langs": sub_langs, "impersonate": "chrome"},
     ]
 
 
@@ -581,7 +611,7 @@ def _pick_info_json(files_found: list) -> pathlib.Path | None:
 def download_video_subtitles(url: str, session_id: str, browser: str = "None",
                               player_client: str = "android_vr", sub_langs: str = DEFAULT_SUB_LANGS,
                               group_by_playlist: bool = True, progress_callback=None,
-                              error_callback=None) -> list:
+                              error_callback=None, cancel_event=None) -> list:
     """
     Download subtitles + metadata for a YouTube video with anti-ban protection.
     
@@ -605,6 +635,9 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
         wrap it with threading.Thread().
     """
     processed_files = []
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelled("Download cancelled before start.")
+
     session_dir = ensure_session_dir(session_id)
     
     title = "YouTube Video"  # Will be updated below
@@ -623,6 +656,9 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     attempts = _subtitle_attempt_plan(player_client, sub_langs)
     
     for attempt_no, attempt in enumerate(attempts, start=1):
+        if cancel_event and cancel_event.is_set():
+            raise OperationCancelled("Download cancelled during subtitle attempts.")
+
         if progress_callback:
             progress_callback(
                 f"Attempt {attempt_no}/{len(attempts)} for '{title}': {attempt['label']}",
@@ -639,13 +675,15 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
                 sub_langs=attempt["sub_langs"],
                 impersonate_target=attempt["impersonate"],
             )
-            _run_ydlp_with_retry(cmd_args)
+            _run_ydlp_with_retry(cmd_args, cancel_event=cancel_event)
         except RateLimitError as e:
             subtitle_attempt_errors.append(str(e))
             continue
         except (TransientNetworkError, BotCheckError, PoTokenError, YtDlpCommandError) as e:
             subtitle_attempt_errors.append(str(e))
             continue
+        except OperationCancelled:
+            raise
         except Exception as e:
             subtitle_attempt_errors.append(str(e))
             continue
@@ -670,6 +708,9 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     
     # Metadata-only fallback if JSON is missing after failures
     if not json_file:
+        if cancel_event and cancel_event.is_set():
+            raise OperationCancelled("Download cancelled before metadata fallback.")
+
         if progress_callback:
             progress_callback(f"Retrying metadata-only for '{title}'...", 0.3)
         
@@ -682,7 +723,9 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
                 player_client="android_vr",
                 impersonate_target="",
             )
-            _run_ydlp_with_retry(fallback_args)
+            _run_ydlp_with_retry(fallback_args, cancel_event=cancel_event)
+        except OperationCancelled:
+            raise
         except Exception as e:
             if error_callback:
                 error_callback(f"Fallback also failed for '{title}': {e}")
@@ -744,6 +787,8 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     
     # Human-like pause between videos (anti-bot measure)
     pause = random.uniform(1.0, 3.0)
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelled("Download cancelled after file write.")
     time.sleep(pause)
     
     if progress_callback:
@@ -757,7 +802,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
 # =============================================================================
 
 def process_local_files(file_paths: list, session_id: str, progress_callback=None,
-                        error_callback=None) -> list:
+                        error_callback=None, cancel_event=None) -> list:
     """
     Process local subtitle files (.vtt, .srt, .txt) with their metadata.
     
@@ -796,6 +841,11 @@ def process_local_files(file_paths: list, session_id: str, progress_callback=Non
     total_stems = len(file_map)
     
     for stem, files in file_map.items():
+        if cancel_event and cancel_event.is_set():
+            if error_callback:
+                error_callback("Local processing cancelled by user.")
+            break
+
         if progress_callback:
             progress_callback(f"Processing local file: {stem}", count / max(1, total_stems))
             
@@ -835,7 +885,10 @@ def process_local_files(file_paths: list, session_id: str, progress_callback=Non
         count += 1
     
     if progress_callback:
-        progress_callback("Finished processing local files.", 1.0)
+        if cancel_event and cancel_event.is_set():
+            progress_callback("Local processing cancelled.", 1.0)
+        else:
+            progress_callback("Finished processing local files.", 1.0)
     
     return processed_files
 

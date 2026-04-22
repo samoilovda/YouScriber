@@ -10,9 +10,8 @@ Run with: python desktop/app_gui.py
 import customtkinter as ctk
 import threading
 import pathlib
-import zipfile
-import os
 import tempfile
+import time
 from pathlib import Path
 from tkinter import filedialog
 
@@ -25,6 +24,7 @@ from core import (
     process_local_files,
     merge_files,
     zip_files,
+    OperationCancelled,
 )
 
 # Set customtkinter theme
@@ -44,14 +44,18 @@ class YouScriberApp(ctk.CTk):
         self.minsize(800, 600)
         
         # Session configuration
-        self.session_id = Path(tempfile.gettempdir()).joinpath("youscriber", f"gui_{self._generate_session_id()}")
-        self.session_id.mkdir(parents=True, exist_ok=True)
+        self.session_id = f"gui_{self._generate_session_id()}"
+        self.session_dir = Path(tempfile.gettempdir()) / "youscriber" / self.session_id
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         
         # State tracking
         self.yt_urls = []
         self.fetched_videos = []
         self.excluded_videos = []
         self.processed_files = []
+        self.video_items = []
+        self.local_files = []
+        self.local_files_labels = {}
         self.browser = "None"
         self.player_client = "android_vr"
         self.group_by_playlist = True
@@ -61,13 +65,18 @@ class YouScriberApp(ctk.CTk):
         
         # Thread safety lock for UI updates
         self.ui_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.worker_lock = threading.Lock()
+        self.active_workers = {}
+        self.stop_event = threading.Event()
+        self.shutting_down = False
         
         # Create UI
         self._create_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
     
     def _generate_session_id(self):
         """Generate a unique session ID."""
-        import time
         return f"{int(time.time())}_{id(self)}"
     
     def _create_ui(self):
@@ -97,6 +106,16 @@ class YouScriberApp(ctk.CTk):
         # Progress label
         self.progress_label = ctk.CTkLabel(self.status_frame, text="Ready")
         self.progress_label.pack(side="left", padx=5, pady=10)
+
+        # Cancel button
+        self.cancel_btn = ctk.CTkButton(
+            self.status_frame,
+            text="Cancel Task",
+            command=self._cancel_active_tasks,
+            width=120,
+            state="disabled",
+        )
+        self.cancel_btn.pack(side="left", padx=5, pady=10)
         
         # Log textbox
         self.log_text = ctk.CTkTextbox(self.status_frame, height=90, width=670)
@@ -158,9 +177,6 @@ class YouScriberApp(ctk.CTk):
         # Create window for video checkboxes
         self.videos_window = ctk.CTkFrame(self.videos_canvas, width=880, height=600)
         self.videos_window.pack_propagate(False)
-        
-        # Videos list (initially empty)
-        self.videos_labels = {}
         
         # Start harvesting frame
         self.harvest_frame = ctk.CTkFrame(youtube_frame)
@@ -228,146 +244,295 @@ class YouScriberApp(ctk.CTk):
         self.merge_combo.pack(side="left", padx=(0, 10))
         
         ctk.CTkLabel(col_local, text="One text file per video / Single combined file / Batch files").pack(side="left")
+
+    def _run_on_ui_thread(self, func, *args):
+        """Execute callable on Tk main thread."""
+        if threading.current_thread() is threading.main_thread():
+            func(*args)
+        else:
+            self.after(0, lambda: func(*args))
+
+    def _prune_workers_locked(self):
+        """Remove completed workers from the active worker map."""
+        stale = [name for name, worker in self.active_workers.items() if not worker.is_alive()]
+        for name in stale:
+            self.active_workers.pop(name, None)
+
+    def _has_active_workers(self):
+        """Return True if any worker is currently running."""
+        with self.worker_lock:
+            self._prune_workers_locked()
+            return bool(self.active_workers)
+
+    def _set_busy_controls(self, busy: bool):
+        """Enable/disable primary controls while work is running."""
+        if busy:
+            self.fetch_btn.configure(state="disabled")
+            self.start_btn.configure(state="disabled")
+            self.process_local_btn.configure(state="disabled")
+            self.cancel_btn.configure(state="normal")
+            return
+
+        self.fetch_btn.configure(state="normal")
+        self.process_local_btn.configure(state="normal")
+        self.start_btn.configure(state="normal" if self.video_items else "disabled")
+        if not self._has_active_workers():
+            self.cancel_btn.configure(state="disabled")
+
+    def _start_worker(self, worker_name: str, target) -> bool:
+        """Start a named non-daemon worker if no other worker is active."""
+        active_names = []
+        worker = None
+        with self.worker_lock:
+            self._prune_workers_locked()
+            if self.shutting_down:
+                return False
+            if self.active_workers:
+                active_names = sorted(self.active_workers.keys())
+            else:
+                self.stop_event.clear()
+                worker = threading.Thread(
+                    target=self._worker_entry,
+                    args=(worker_name, target),
+                    name=f"youscriber-{worker_name}",
+                    daemon=False,
+                )
+                self.active_workers[worker_name] = worker
+
+        if active_names:
+            self._add_log(f"⚠️ Task already running: {', '.join(active_names)}")
+            return False
+
+        self._set_busy_controls(True)
+        worker.start()
+        return True
+
+    def _worker_entry(self, worker_name: str, target):
+        """Run worker target and always release worker bookkeeping."""
+        try:
+            target(self.stop_event)
+        except OperationCancelled as exc:
+            self._run_on_ui_thread(self._add_log, f"⚠️ {str(exc)}")
+        except Exception as exc:
+            self._run_on_ui_thread(self._add_log, f"❌ Worker '{worker_name}' failed: {str(exc)}")
+        finally:
+            with self.worker_lock:
+                self.active_workers.pop(worker_name, None)
+                has_workers = bool(self.active_workers)
+            if not has_workers:
+                self.stop_event.clear()
+                if not self.shutting_down:
+                    self._run_on_ui_thread(self._set_busy_controls, False)
+
+    def _cancel_active_tasks(self):
+        """Request cancellation for active worker(s)."""
+        with self.worker_lock:
+            self._prune_workers_locked()
+            active_names = sorted(self.active_workers.keys())
+        if not active_names:
+            self._add_log("ℹ️ No active background tasks.")
+            self.cancel_btn.configure(state="disabled")
+            return
+
+        self.stop_event.set()
+        self._add_log(f"🛑 Cancellation requested for: {', '.join(active_names)}")
+
+    def _join_active_workers(self, timeout_seconds: float = 20.0) -> bool:
+        """Wait for active workers to finish."""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            with self.worker_lock:
+                self._prune_workers_locked()
+                workers = list(self.active_workers.values())
+            if not workers:
+                return True
+            for worker in workers:
+                remaining = max(0.0, deadline - time.time())
+                if remaining <= 0:
+                    break
+                worker.join(timeout=min(0.3, remaining))
+        return not self._has_active_workers()
+
+    def _on_close_requested(self):
+        """Gracefully shut down active workers before closing UI."""
+        if self.shutting_down:
+            return
+
+        self.shutting_down = True
+        self._set_busy_controls(True)
+        self.cancel_btn.configure(state="disabled")
+        self.stop_event.set()
+        self._add_log("Shutting down. Waiting for active tasks to stop...")
+
+        def close_after_join():
+            joined = self._join_active_workers(timeout_seconds=20.0)
+            if not joined:
+                self._run_on_ui_thread(
+                    self._add_log,
+                    "⚠️ Timed out waiting for workers. Close was cancelled; try again after tasks stop.",
+                )
+                self.shutting_down = False
+                self._run_on_ui_thread(self._set_busy_controls, self._has_active_workers())
+                return
+            self._run_on_ui_thread(self.destroy)
+
+        threading.Thread(target=close_after_join, daemon=True).start()
     
     def _update_ui(self, status_text: str, percentage: float = 1.0):
         """Thread-safe UI update method."""
         def update():
             with self.ui_lock:
-                self.progress_bar.set(min(1.0, percentage))
+                self.progress = min(1.0, max(0.0, percentage))
+                self.progress_bar.set(self.progress)
                 self.progress_label.configure(text=status_text)
-                # FIXED: Removed self.processed_files = [] to prevent race condition data loss
-                # Clear log
-                self.log_text.configure(state="normal")
-                self.log_text.delete("1.0", "end")
-                self.log_text.configure(state="disabled")
         
-        self.after(0, update)
+        self._run_on_ui_thread(update)
     
     def _add_log(self, message: str):
         """Add a message to the log (thread-safe)."""
-        with self.ui_lock:
-            self.log_entries.insert(0, message)
-            if len(self.log_entries) > 100:
-                self.log_entries = self.log_entries[:100]
-            # Show last 50 entries
-            log_text = '\n'.join(self.log_entries[-50:])
-            self.log_text.configure(state="normal")
-            self.log_text.delete("1.0", "end")
-            self.log_text.insert("1.0", log_text)
-            self.log_text.configure(state="disabled")
+        def add():
+            with self.ui_lock:
+                self.log_entries.insert(0, message)
+                if len(self.log_entries) > 100:
+                    self.log_entries = self.log_entries[:100]
+                log_text = '\n'.join(self.log_entries[:50])
+                self.log_text.configure(state="normal")
+                self.log_text.delete("1.0", "end")
+                self.log_text.insert("1.0", log_text)
+                self.log_text.configure(state="disabled")
+
+        self._run_on_ui_thread(add)
     
     def _fetch_list(self):
         """Fetch video list from YouTube."""
+        if self._has_active_workers():
+            self._add_log("⚠️ Wait for current task to finish or cancel it first.")
+            return
+
         if not self.url_entry.get().strip():
             self._add_log("⚠️ Please enter at least one YouTube URL.")
             return
 
         # Pull current selections from UI controls before launching worker thread.
-        self.browser = self.browser_combo.get()
-        self.player_client = self.player_combo.get()
+        browser = self.browser_combo.get()
+        player_client = self.player_combo.get()
         
         urls = [url.strip() for url in self.url_entry.get().strip().split('\n') 
                 if url.strip() and 'youtube.com' in url]
         
         self._add_log(f"Fetching list for {len(urls)} URL(s)...")
         
-        def fetch():
+        def fetch(stop_event):
             try:
                 video_list = fetch_video_list(
                     urls,
-                    browser=self.browser,
-                    player_client=self.player_client,
+                    browser=browser,
+                    player_client=player_client,
                     progress_callback=lambda st, pg: self._update_ui(st, pg),
-                    error_callback=lambda msg: self._add_log(f"❌ {msg}")
+                    error_callback=lambda msg: self._add_log(f"❌ {msg}"),
+                    cancel_event=stop_event,
                 )
-                self.fetched_videos = video_list
-                self._add_log(f"✓ Fetched {len(video_list)} video(s)")
-                
-                if video_list:
-                    self._add_log(f"✓ Found {len(video_list)} video(s)!")
-                    
-                    # Update videos frame
-                    self._populate_videos_frame(video_list)
-                    
-                    # Enable start button
-                    self.start_btn.configure(state="normal")
-                    
-                    # Clear excluded videos
-                    self.excluded_videos = []
+                if stop_event.is_set():
+                    self._run_on_ui_thread(self._on_fetch_cancelled)
+                    return
+                self._run_on_ui_thread(self._on_fetch_complete, video_list)
             except Exception as e:
-                self._add_log(f"❌ Error: {str(e)}")
-                self._add_log(f"Error fetching videos: {str(e)}")
+                self._run_on_ui_thread(self._add_log, f"❌ Error: {str(e)}")
+                self._run_on_ui_thread(self._add_log, f"Error fetching videos: {str(e)}")
         
-        # Run in separate thread
-        threading.Thread(target=fetch, daemon=True).start()
+        self._start_worker("fetch", fetch)
+
+    def _on_fetch_complete(self, video_list):
+        """Handle fetch completion on main thread."""
+        self.fetched_videos = video_list
+        self._populate_videos_frame(video_list)
+        self._add_log(f"✓ Fetched {len(video_list)} video(s)")
+
+        if video_list:
+            self._add_log(f"✓ Found {len(video_list)} video(s)!")
+            self.start_btn.configure(state="normal")
+            self.excluded_videos = []
+        else:
+            self.start_btn.configure(state="disabled")
+
+    def _on_fetch_cancelled(self):
+        """Handle cancelled fetch."""
+        self._add_log("⚠️ Fetch cancelled.")
+        self._update_ui("Fetch cancelled", self.progress)
     
     def _populate_videos_frame(self, video_list):
         """Populate the videos frame with checkboxes."""
+        if threading.current_thread() is not threading.main_thread():
+            self._run_on_ui_thread(self._populate_videos_frame, video_list)
+            return
+
         # Clear existing
-        for label in self.videos_labels.values():
-            label.destroy()
-        self.videos_labels.clear()
-        
-        # Calculate scrollbar height
-        canvas_width = self.videos_canvas.winfo_reqwidth()
-        frame_width = self.videos_window.winfo_width()
-        canvas_height = self.videos_canvas.winfo_reqheight()
-        frame_height = self.videos_window.winfo_height()
-        
-        # Adjust window size based on number of videos
-        required_height = len(video_list) * 50 + 100
-        new_height = min(required_height, frame_height * 2)
-        self.videos_window.update_idletasks()
+        for item in self.video_items:
+            item["checkbox"].destroy()
+        self.video_items = []
         
         # Pack videos
         for idx, video in enumerate(video_list):
-            checkbox = ctk.CTkCheckBox(self.videos_window, text=video['title'], 
-                                       variable=ctk.StringVar(value=True))
+            selected_var = ctk.BooleanVar(value=True)
+            checkbox = ctk.CTkCheckBox(
+                self.videos_window,
+                text=video['title'],
+                variable=selected_var,
+            )
             checkbox.grid(row=idx, column=0, padx=10, pady=5, sticky="w")
-            self.videos_labels[video['title']] = checkbox
+            self.video_items.append(
+                {"video": video, "selected": selected_var, "checkbox": checkbox}
+            )
     
     def _start_harvesting(self):
         """Start harvesting subtitles from selected videos."""
-        selected = [video for video, checkbox in self.videos_labels.items() 
-                    if checkbox.get() == 1]
+        if self._has_active_workers():
+            self._add_log("⚠️ Wait for current task to finish or cancel it first.")
+            return
+
+        selected = [item["video"] for item in self.video_items if item["selected"].get()]
         
         if not selected:
             self._add_log("⚠️ Please select at least one video to harvest.")
             return
 
         # Pull current selections from UI controls before launching worker thread.
-        self.browser = self.browser_combo.get()
-        self.player_client = self.player_combo.get()
-        self.group_by_playlist = self.group_var.get()
+        browser = self.browser_combo.get()
+        player_client = self.player_combo.get()
+        group_by_playlist = self.group_var.get()
         
-        self.start_btn.configure(state="disabled")
         self._add_log(f"🌱 Starting to harvest subtitles from {len(selected)} video(s)...")
         
-        def harvest():
+        def harvest(stop_event):
             try:
-                st_session_id = str(self.session_id)
-                selected_videos = selected
-                total_videos = len(selected_videos)
+                st_session_id = self.session_id
+                selected_videos = list(selected)
+                total_videos = max(1, len(selected_videos))
                 processed_files = []
                 
                 for i, video in enumerate(selected_videos):
+                    if stop_event.is_set():
+                        self._run_on_ui_thread(self._on_harvest_cancelled, processed_files)
+                        return
+
                     url = video.get('url', '')
                     progress = (i / total_videos) * 0.9
                     
                     # Update progress
                     self._update_ui(f"Processing: {video['title'][:50]}", 
-                                   progress - self.progress)
+                                   progress)
                     self._add_log(f"Processing: {video['title'][:50]}")
                     
                     try:
                         result = download_video_subtitles(
                             url,
                             session_id=st_session_id,
-                            browser=self.browser,
-                            player_client=self.player_client,
-                            group_by_playlist=self.group_by_playlist,
+                            browser=browser,
+                            player_client=player_client,
+                            group_by_playlist=group_by_playlist,
                             progress_callback=lambda st, pg: self._update_ui(st, pg),
-                            error_callback=lambda msg: self._add_log(f"❌ {msg}")
+                            error_callback=lambda msg: self._add_log(f"❌ {msg}"),
+                            cancel_event=stop_event,
                         )
                         
                         if result:
@@ -375,22 +540,36 @@ class YouScriberApp(ctk.CTk):
                             self._add_log(f"✓ Downloaded: {video['title'][:50]}...")
                         else:
                             self._add_log(f"⚠️ No subtitles found for: {video['title'][:50]}")
+                    except OperationCancelled:
+                        self._run_on_ui_thread(self._on_harvest_cancelled, processed_files)
+                        return
                     except Exception as e:
                         self._add_log(f"❌ Error processing {video['title'][:50]}: {str(e)}")
                 
-                # Update final progress
-                self._update_ui("Processing complete", 0.1)
-                self._update_ui("Ready", 1.0)
-                
-                self.processed_files = processed_files
-                self._add_log(f"✓ Harvesting complete! Processed {len(processed_files)} video(s).")
+                self._run_on_ui_thread(self._on_harvest_complete, processed_files)
                 
             except Exception as e:
-                self._add_log(f"❌ Harvesting error: {str(e)}")
-                self._add_log(str(e))
-        
-        # Run in separate thread
-        threading.Thread(target=harvest, daemon=True).start()
+                self._run_on_ui_thread(self._on_harvest_failed, str(e))
+
+        self._start_worker("harvest", harvest)
+
+    def _on_harvest_complete(self, processed_files):
+        """Finalize harvest state on main thread."""
+        self._update_ui("Ready", 1.0)
+        with self.state_lock:
+            self.processed_files = list(processed_files)
+        self._add_log(f"✓ Harvesting complete! Processed {len(processed_files)} video(s).")
+
+    def _on_harvest_failed(self, error_message: str):
+        """Handle harvest failure on main thread."""
+        self._add_log(f"❌ Harvesting error: {error_message}")
+
+    def _on_harvest_cancelled(self, processed_files):
+        """Handle harvest cancellation on main thread."""
+        with self.state_lock:
+            self.processed_files = list(processed_files)
+        self._add_log(f"⚠️ Harvest cancelled. Kept {len(processed_files)} processed file(s).")
+        self._update_ui("Harvest cancelled", self.progress)
     
     def _select_local_files(self):
         """Open file dialog to select local subtitle files."""
@@ -433,32 +612,54 @@ class YouScriberApp(ctk.CTk):
     
     def _process_local_files(self):
         """Process selected local files."""
+        if self._has_active_workers():
+            self._add_log("⚠️ Wait for current task to finish or cancel it first.")
+            return
+
         if not hasattr(self, 'local_files') or not self.local_files:
             self._add_log("⚠️ Please select files first.")
             return
         
-        self._add_log(f"Processing {len(self.local_files)} local file(s)...")
+        local_files = list(self.local_files)
+        self._add_log(f"Processing {len(local_files)} local file(s)...")
         
-        def process():
+        def process(stop_event):
             try:
                 processed = process_local_files(
-                    self.local_files,
-                    session_id=str(self.session_id),
+                    local_files,
+                    session_id=self.session_id,
                     progress_callback=lambda st, pg: self._update_ui(st, pg),
-                    error_callback=lambda msg: self._add_log(f"❌ {msg}")
+                    error_callback=lambda msg: self._add_log(f"❌ {msg}"),
+                    cancel_event=stop_event,
                 )
-                
-                self._update_ui(f"✓ Processed {len(processed)} file(s)", 1.0)
-                self._add_log(f"✓ Local files processed! Total: {len(processed)} file(s)")
-                
-                # Add to processed files
-                self.processed_files.extend(processed)
-                
+                if stop_event.is_set():
+                    self._run_on_ui_thread(self._on_local_process_cancelled, processed)
+                    return
+                self._run_on_ui_thread(self._on_local_process_complete, processed)
             except Exception as e:
-                self._add_log(f"❌ Error: {str(e)}")
-        
-        # Run in separate thread
-        threading.Thread(target=process, daemon=True).start()
+                self._run_on_ui_thread(self._on_local_process_failed, str(e))
+
+        self._start_worker("local-process", process)
+
+    def _on_local_process_complete(self, processed):
+        """Finalize local file processing on main thread."""
+        self._update_ui(f"✓ Processed {len(processed)} file(s)", 1.0)
+        with self.state_lock:
+            self.processed_files.extend(processed)
+            total = len(self.processed_files)
+        self._add_log(f"✓ Local files processed! Total: {total} file(s)")
+
+    def _on_local_process_failed(self, error_message: str):
+        """Handle local file processing failure on main thread."""
+        self._add_log(f"❌ Error: {error_message}")
+
+    def _on_local_process_cancelled(self, processed):
+        """Handle cancelled local-file processing."""
+        with self.state_lock:
+            self.processed_files.extend(processed)
+            total = len(self.processed_files)
+        self._add_log(f"⚠️ Local processing cancelled. Total retained: {total} file(s).")
+        self._update_ui("Local processing cancelled", self.progress)
     
     def _update_merge_strategy(self):
         """Update merge strategy from combo box."""
@@ -466,24 +667,37 @@ class YouScriberApp(ctk.CTk):
     
     def _download(self):
         """Create and download ZIP of processed files."""
-        if not self.processed_files:
+        if self._has_active_workers():
+            self._add_log("⚠️ Wait for current task to finish or cancel it first.")
+            return
+
+        with self.state_lock:
+            files_to_export = list(self.processed_files)
+
+        if not files_to_export:
             self._add_log("⚠️ No processed files to download.")
             return
         
+        merge_strategy = self.merge_combo.get()
+        session_dir = self.session_dir
+        session_id = self.session_id
         self._add_log("Creating ZIP archive...")
         
-        def download():
+        def download(stop_event):
             try:
+                if stop_event.is_set():
+                    raise OperationCancelled("Download cancelled before merge started.")
                 # Merge files
-                session_dir = pathlib.Path(tempfile.gettempdir()) / "youscriber" / self.session_id
                 merged_files = merge_files(
-                    self.processed_files,
-                    self.merge_strategy,
+                    files_to_export,
+                    merge_strategy,
                     session_dir
                 )
+                if stop_event.is_set():
+                    raise OperationCancelled("Download cancelled before ZIP creation.")
                 
                 # Create ZIP
-                output_zip = f"youscriber_output_{self.session_id}.zip"
+                output_zip = f"youscriber_output_{session_id}.zip"
                 output_path = pathlib.Path(tempfile.gettempdir()) / output_zip
                 
                 zip_files(merged_files, output_path)
@@ -500,9 +714,8 @@ class YouScriberApp(ctk.CTk):
                 
             except Exception as e:
                 self._add_log(f"❌ Error creating ZIP: {str(e)}")
-        
-        # Run in separate thread
-        threading.Thread(target=download, daemon=True).start()
+
+        self._start_worker("download", download)
 
 
 def main():

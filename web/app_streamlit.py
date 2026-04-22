@@ -12,6 +12,7 @@ import pathlib
 import zipfile
 import os
 import tempfile
+import uuid
 from pathlib import Path
 
 # Import shared business logic
@@ -49,7 +50,8 @@ def init_session_state():
     if 'player_client' not in st.session_state:
         st.session_state['player_client'] = 'android_vr'
     if 'session_id' not in st.session_state:
-        st.session_state['session_id'] = st.session_state.get('run_id', 'default')
+        run_id = st.session_state.get('run_id')
+        st.session_state['session_id'] = str(run_id) if run_id else f"web_{uuid.uuid4().hex}"
     if 'progress' not in st.session_state:
         st.session_state['progress'] = 0.0
     if 'last_status' not in st.session_state:
