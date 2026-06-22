@@ -2,6 +2,7 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
 import uuid
+import subprocess
 import core
 import pathlib
 
@@ -15,6 +16,7 @@ class App(ctk.CTk):
         self.geometry("900x700")
         
         self.session_id = str(uuid.uuid4())
+        self.cancel_event = threading.Event()
         self.video_list = []
         self.list_type = "videos"
         self.local_files = []
@@ -121,6 +123,9 @@ class App(ctk.CTk):
         self.harvest_btn = ctk.CTkButton(bottom_frame, text="Start Harvesting", command=self.start_harvest, state="disabled", fg_color="green")
         self.harvest_btn.pack(side="right", pady=10)
         
+        self.cancel_btn = ctk.CTkButton(bottom_frame, text="Cancel", command=self.cancel_operation, state="disabled", fg_color="red")
+        self.cancel_btn.pack(side="right", padx=10, pady=10)
+        
         self.status_lbl = ctk.CTkLabel(tab, text="Ready")
         self.status_lbl.grid(row=4, column=0, padx=10, sticky="w")
         
@@ -168,6 +173,12 @@ class App(ctk.CTk):
         self.merge_btn.pack(pady=20)
 
     # --------------- CALLBACKS & THREADING ---------------
+    def cancel_operation(self):
+        self.cancel_event.set()
+        self.update_status("Cancelling...", "youtube")
+        self.update_status("Cancelling...", "local")
+        self.cancel_btn.configure(state="disabled")
+
     def update_status(self, text, tab="youtube"):
         if tab == "youtube":
             self.status_lbl.configure(text=text)
@@ -214,6 +225,8 @@ class App(ctk.CTk):
             cb.destroy()
         self.video_checkboxes.clear()
         self.harvest_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.cancel_event.clear()
 
         threading.Thread(target=self._fetch_thread, args=(urls, browser), daemon=True).start()
 
@@ -243,6 +256,8 @@ class App(ctk.CTk):
             cb.destroy()
         self.video_checkboxes.clear()
         self.harvest_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.cancel_event.clear()
 
         threading.Thread(target=self._fetch_thread, args=(urls, browser), daemon=True).start()
 
@@ -250,7 +265,7 @@ class App(ctk.CTk):
         def status_cb(msg): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
         
-        videos = core.fetch_playlist_info(urls, browser, status_callback=status_cb, error_callback=err_cb)
+        videos = core.fetch_video_list(urls, browser, progress_callback=status_cb, error_callback=err_cb, cancel_event=self.cancel_event)
         self.after(0, self._on_fetch_complete, videos)
 
     def _on_fetch_complete(self, videos):
@@ -275,6 +290,7 @@ class App(ctk.CTk):
             
         self.fetch_btn.configure(state="normal")
         self.fetch_channel_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
 
     def start_harvest(self):
         selected_items = [v for v in self.video_list if v.get('_selected_var') and v['_selected_var'].get()]
@@ -290,6 +306,8 @@ class App(ctk.CTk):
         self.fetch_btn.configure(state="disabled")
         self.fetch_channel_btn.configure(state="disabled")
         self.progress_bar.set(0)
+        self.cancel_btn.configure(state="normal")
+        self.cancel_event.clear()
 
         if self.list_type == "playlists":
             threading.Thread(target=self._expand_and_harvest_thread, args=(selected_items, group, browser), daemon=True).start()
@@ -304,7 +322,7 @@ class App(ctk.CTk):
         stat_cb("Expanding selected playlists into individual videos...")
         playlist_urls = [p.get('url') for p in playlists if p.get('url')]
         
-        expanded_videos = core.fetch_playlist_info(playlist_urls, browser, status_callback=stat_cb, error_callback=err_cb)
+        expanded_videos = core.fetch_video_list(playlist_urls, browser, progress_callback=stat_cb, error_callback=err_cb, cancel_event=self.cancel_event)
         
         if not expanded_videos:
             err_cb("Failed to expand any videos from the selected playlists.")
@@ -314,7 +332,7 @@ class App(ctk.CTk):
             return
             
         stat_cb(f"Successfully expanded into {len(expanded_videos)} videos.")
-        files = core.download_videos(expanded_videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb)
+        files = core.download_videos(expanded_videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb, self.cancel_event)
         self.after(0, self._on_harvest_complete, files)
 
     def _harvest_thread(self, videos, group, browser):
@@ -322,13 +340,14 @@ class App(ctk.CTk):
         def stat_cb(msg): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
         
-        files = core.download_videos(videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb)
+        files = core.download_videos(videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb, self.cancel_event)
         self.after(0, self._on_harvest_complete, files)
 
     def _on_harvest_complete(self, files):
         self.harvest_btn.configure(state="normal")
         self.fetch_btn.configure(state="normal")
         self.fetch_channel_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
         self.processed_files.extend(files)
         self.update_export_tab()
         messagebox.showinfo("Done", f"Harvested {len(files)} files successfully.")
@@ -353,7 +372,7 @@ class App(ctk.CTk):
         def stat_cb(msg): self.after(0, self.update_status, msg, "local")
         def err_cb(msg): self.after(0, self.show_error, msg)
         
-        res = core.process_local_files(files, self.session_id, prog_cb, stat_cb, err_cb)
+        res = core.process_local_files(files, self.session_id, prog_cb, stat_cb, err_cb, self.cancel_event)
         self.after(0, self._on_local_complete, res)
 
     def _on_local_complete(self, files):
@@ -384,8 +403,8 @@ class App(ctk.CTk):
         messagebox.showinfo("Merge Complete", f"Files successfully merged/prepared in:\n{out_folder}")
         
         try:
-            core.subprocess.run(["open", out_folder])
-        except:
+            subprocess.run(["open", out_folder])
+        except Exception:
             pass
 
 if __name__ == "__main__":

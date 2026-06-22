@@ -1,17 +1,14 @@
 # YouScriber - Dependencies
 
-# Core dependencies
+# Core
 yt-dlp>=2026.1.0
 tenacity>=8.2.0
 
-# Web interface
-streamlit>=1.28.0
-
-# Desktop interface
+# Desktop interface (gui.py)
 customtkinter>=5.2.2
 
-# Build tools
+# Build tool (packages gui.py into a standalone app via YouScriber.spec)
 pyinstaller>=6.3.0
 
-# Optional but recommended
+# Optional but recommended for best yt-dlp performance
 ffmpeg-python>=0.2.0

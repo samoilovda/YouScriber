@@ -1,63 +1,63 @@
-# YouScriber Instructions
+# YouScriber
 
-## Installation & Setup
+Извлечение субтитров из YouTube-видео, их очистка (без тайм-кодов и тегов) и
+подготовка текста для передачи в LLM / написания книги.
 
-1.  **Prerequisites**:
-    *   Python 3.8+ installed.
-    *   `ffmpeg` is recommended for optimal `yt-dlp` performance, though often optional for just subtitles.
-        *   **macOS**: `brew install ffmpeg`
-        *   **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH.
+## Установка
 
-2.  **Install Dependencies**:
-    Open your terminal or command prompt in the project folder and run:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-### YouTube Subtitles Failing (2026 PO Token Rollout)
-If subtitle extraction starts failing with bot/403/empty subtitle behavior:
-
-1. Update `yt-dlp` first:
+1. Python 3.10+.
+2. (Рекомендуется) `ffmpeg` — `brew install ffmpeg` на macOS.
+3. Зависимости:
    ```bash
-   python -m pip install -U --pre "yt-dlp[default]"
+   pip install -r requirements.txt
    ```
-2. Use browser cookies only when needed (private/age-restricted/member content), and keep request rate low.
-3. If your network/account is heavily challenged, set custom extractor args via env var before launching the app:
-   ```bash
-   export YOUSCRIBER_YT_EXTRACTOR_ARGS='player_client=mweb;fetch_pot=auto'
-   ```
-4. For strict PO-token environments, install a PO-token provider plugin and pass its recommended extractor args.
 
-## Running the App
+## Способы использования
 
-Run the following command in your terminal:
+### 1. Десктоп-приложение (GUI)
 
 ```bash
-streamlit run app.py
+python gui.py
 ```
 
-This will open the application in your default web browser (usually at `http://localhost:8501`).
+Откроется окно: вставьте ссылки на видео/плейлисты/каналы (по одной в строке),
+при необходимости настройте слияние файлов и нажмите запуск. Готовые `.txt`
+сохраняются во временную сессию и открываются по кнопке.
 
-## Usage Guide
+Сборка standalone-приложения (`dist/YouScriber.app`):
+```bash
+pyinstaller YouScriber.spec
+```
 
-### Tab 1: YouTube Import
-1.  Paste YouTube URLs into the text area (one per line). Supported:
-    *   Single video URLs
-    *   Playlist URLs
-    *   Channel URLs
-2.  (Optional) Uncheck "Group by Playlist" if you want all files in one flat structure.
-3.  Click **"Start Harvesting"**.
-4.  Wait for the process to complete.
+### 2. Пакетный скрипт (CLI)
 
-### Tab 2: Local Import
-1.  If you have manually downloaded `.vtt` or `.srt` files and their accompanying `.info.json` files, upload them here.
-2.  You can select multiple files at once.
-3.  The app will automatically pair subtitle files with metadata JSONs if they share the same filename.
-4.  Click **"Process Local Files"**.
+Для быстрой выгрузки фиксированного списка видео отредактируйте список `URLS`
+в [grab_subs.py](grab_subs.py) и запустите:
 
-### Export & Merging
-1.  **Merge Strategy**: In the sidebar, choose how you want your files:
-    *   **No Merge**: Standard behavior. One text file per video, downloaded as a ZIP.
-    *   **One File**: All videos are concatenated into a single `All_Processed_Videos.txt` file.
-    *   **Medium/Large Chunks**: Videos are grouped into batches (approx 50k or 200k characters) to fit context windows, downloaded as a ZIP of batches.
-2.  Once files are processed, click the **"Download"** button at the bottom. The button label will adapt to your chosen strategy.
+```bash
+python grab_subs.py
+```
+
+Очищенные транскрипты появятся в `output/transcripts/`.
+
+## Язык субтитров
+
+По умолчанию берётся оригинальная дорожка: `ru-orig, ru, en-orig, en`
+(подходит и для русских, и для английских каналов). Переопределить можно
+переменной окружения:
+
+```bash
+export YOUSCRIBER_SUB_LANGS='en-orig,en'
+```
+
+> Примечание: используются автоматические субтитры (распознавание речи), в них
+> возможны ошибки распознавания — это сырьё под дальнейшую обработку.
+
+## Структура
+
+| Файл | Назначение |
+|------|------------|
+| `core.py` | Вся бизнес-логика: загрузка, очистка, слияние, экспорт |
+| `gui.py` | Десктоп-интерфейс (CustomTkinter) |
+| `grab_subs.py` | CLI-скрипт пакетной выгрузки |
+| `YouScriber.spec` | Конфиг сборки PyInstaller |

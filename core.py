@@ -14,19 +14,12 @@ PRODUCTION ANTI-BAN CONFIGURATION:
 import yt_dlp
 import pathlib
 import re
-import zipfile
-import io
 import tempfile
 import json
-import shutil
-import traceback
-import subprocess
 import os
-import sys
 import fnmatch
 import random
 import time
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 
 # =============================================================================
@@ -36,9 +29,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 BASE_TEMP_DIR = pathlib.Path(tempfile.gettempdir()) / "youscriber"
 
 # Default subtitle language preferences (configurable via environment variables)
-DEFAULT_SUB_LANGS = os.getenv("YOUSCRIBER_SUB_LANGS", "en.*,en")
-SECONDARY_SUB_LANGS = os.getenv("YOUSCRIBER_SECONDARY_SUB_LANGS", "ru.*,ru,uk.*,uk")
-FALLBACK_SUB_LANGS = "all,-live_chat"
+# Prefer the original-language auto-caption track (-orig) first, then plain
+# language tracks, then English. This works for Russian-language channels as
+# well as English ones; yt-dlp simply picks whichever tracks exist.
+DEFAULT_SUB_LANGS = os.getenv("YOUSCRIBER_SUB_LANGS", "ru-orig,ru,en-orig,en")
 
 
 def ensure_session_dir(session_id: str) -> pathlib.Path:
@@ -47,77 +41,6 @@ def ensure_session_dir(session_id: str) -> pathlib.Path:
     if not session_dir.exists():
         session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
-
-
-def clear_session_dir(session_id: str):
-    """Clear and recreate a session directory."""
-    session_dir = BASE_TEMP_DIR / session_id
-    if session_dir.exists():
-        shutil.rmtree(session_dir)
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-
-# =============================================================================
-# ANTI-BAN YOUTUBE EXTRACTION CONFIGURATION
-# =============================================================================
-
-def get_yt_dlp_opts(browser: str = "None", player_client: str = "android_vr",
-                    sub_langs: str = DEFAULT_SUB_LANGS, impersonate_target: str = "") -> dict:
-    """
-    Get yt-dlp options with production-level anti-ban configuration.
-    
-    CRITICAL ANTI-BAN SETTINGS:
-    - cookiesfrombrowser: Uses selected browser cookies to bypass bot detection
-    - sleep_interval_requests: Randomized 3-8 second delay between requests
-    - min_sleep / max_sleep: Range for exponential backoff
-    
-    Args:
-        browser: Browser name for cookie extraction (default: 'None' to disable)
-        player_client: Player client to impersonate (android_vr, web_safari, etc.)
-        sub_langs: Subtitle language pattern
-        impersonate_target: Target browser for impersonation
-    
-    Returns:
-        Dictionary of yt-dlp options ready for YoutubeDL()
-    """
-    # Resolve extractor args based on environment or defaults
-    env_override = os.getenv("YOUSCRIBER_YT_EXTRACTOR_ARGS", "").strip()
-    if env_override:
-        extractor_args = {"youtube": env_override}
-    else:
-        extractor_args = {
-            "youtube": {
-                "player_client": [player_client],
-                "fetch_pot": ["auto"]
-            }
-        }
-    
-    return {
-        'extractor_retries': 5,
-        'remote_components': ['ejs:github'],
-        'extractor_args': extractor_args,
-        # Anti-ban: Use browser cookies for authentication
-        'cookiesfrombrowser': (browser,) if browser and browser != "None" else [],
-        # Anti-ban: Randomized sleep intervals to avoid rate limiting
-        'sleep_interval_requests': 3,
-        'min_sleep': 3,
-        'max_sleep': 8,
-        # Ignore errors to continue processing
-        'ignoreerrors': True,
-        # Don't download video, just subtitles and metadata
-        'skip_download': True,
-        'quiet': True,
-        # Retries for network resilience
-        'retries': 10,
-        'fragment_retries': 10,
-        # Subtitle extraction settings
-        'write_sub': True,
-        'write_auto_sub': True,
-        'sub_langs': sub_langs,
-        'sleep_subtitles': 2,
-        # Output template for downloaded files
-        'outtmpl': '%(title)s [%(id)s].%(ext)s',
-    }
 
 
 # =============================================================================
@@ -348,36 +271,8 @@ def fetch_video_list(urls: list, browser: str = "None", player_client: str = "an
 
 
 # =============================================================================
-# EXCEPTION CLASSES FOR ANTI-BAN ERRORS
+# EXCEPTIONS
 # =============================================================================
-
-class RateLimitError(Exception):
-    """Raised when YouTube returns HTTP 429 Too Many Requests."""
-    pass
-
-
-class TransientNetworkError(Exception):
-    """Raised for temporary network resolution/transport failures."""
-    pass
-
-
-class BotCheckError(Exception):
-    """Raised when YouTube asks to confirm the requester is not a bot."""
-    pass
-
-
-class PoTokenError(Exception):
-    """Raised when extraction likely failed due to PO token enforcement."""
-    pass
-
-
-class YtDlpCommandError(Exception):
-    """Raised for non-zero yt-dlp command failures."""
-    
-    def __init__(self, message: str, output: str = ""):
-        super().__init__(message)
-        self.output = output
-
 
 class OperationCancelled(Exception):
     """Raised when the current operation is cancelled by user request."""
@@ -385,168 +280,52 @@ class OperationCancelled(Exception):
 
 
 # =============================================================================
-# YOUTUBE DOWNLOAD WITH ANTI-BAN MEASURES
+# YOUTUBE SUBTITLE DOWNLOAD
 # =============================================================================
 
-@retry(
-    retry=retry_if_exception_type((RateLimitError, TransientNetworkError)),
-    wait=wait_exponential(multiplier=1, min=15, max=90),
-    stop=stop_after_attempt(4),
-    reraise=True,
-)
-def _run_ydlp_with_retry(cmd_args: list, cwd: pathlib.Path | None = None, cancel_event=None):
+def _safe_name(text: str) -> str:
+    """Reduce an arbitrary string to a filesystem-safe path segment."""
+    return "".join(c for c in text if c.isalnum() or c in " -_()").strip()
+
+
+def _ydlp_download(url: str, out_dir: pathlib.Path, browser: str,
+                   sub_langs: str = DEFAULT_SUB_LANGS, player_client: str = "android_vr"):
     """
-    Wrap yt-dlp subprocess call with exponential back-off on rate limits.
-    
-    Args:
-        cmd_args: Command line arguments for yt-dlp
-        cwd: Working directory (optional)
+    Fetch metadata + best available subtitle tracks in a single yt-dlp call.
+
+    A single request covering all requested languages avoids the request-storm
+    that triggers YouTube's HTTP 429 rate limiting. ``ignoreerrors`` keeps a
+    failure on one language (e.g. a 429 on a secondary track) from discarding
+    the rest of the download. Returns the metadata dict from extract_info.
     """
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="ignore") as output_stream:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "yt_dlp"] + cmd_args,
-            stdout=output_stream,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=cwd,
-        )
-
-        while proc.poll() is None:
-            if cancel_event and cancel_event.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-                raise OperationCancelled("yt-dlp run cancelled by user.")
-            time.sleep(0.25)
-
-        output_stream.flush()
-        output_stream.seek(0)
-        combined = output_stream.read()
-
-    if combined:
-        print(combined, end="")
-    
-    lower = combined.lower()
-    if "http error 429" in lower or "too many requests" in lower:
-        raise RateLimitError("YouTube returned HTTP 429: Too Many Requests")
-    if _is_retryable_network_error(combined):
-        raise TransientNetworkError(_brief_ydlp_error(combined))
-    if "sign in to confirm you're not a bot" in lower:
-        raise BotCheckError(_brief_ydlp_error(combined))
-    if "po token" in lower and "youtube" in lower:
-        raise PoTokenError(_brief_ydlp_error(combined))
-    if "http error 403" in lower and "youtube" in lower:
-        raise PoTokenError(_brief_ydlp_error(combined))
-    if proc.returncode != 0:
-        raise YtDlpCommandError(_brief_ydlp_error(combined), combined)
-    
-    return proc.returncode
-
-
-def _is_retryable_network_error(output: str) -> bool:
-    """Check if the output contains retryable network errors."""
-    markers = (
-        "failed to resolve",
-        "temporary failure in name resolution",
-        "timed out",
-        "connection reset",
-        "network is unreachable",
-        "transporterror",
-    )
-    text = output.lower()
-    return any(marker in text for marker in markers)
-
-
-def _brief_ydlp_error(output: str) -> str:
-    """Extract brief error from yt-dlp output."""
-    for line in output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("ERROR:") or stripped.startswith("WARNING:"):
-            return stripped
-    return "yt-dlp failed without a detailed error line."
-
-
-def _build_download_cmd(video_url: str, out_dir: pathlib.Path, browser: str,
-                        with_subs: bool = True, player_client: str = "android_vr",
-                        sub_langs: str = DEFAULT_SUB_LANGS, impersonate_target: str = "") -> list:
-    """
-    Build yt-dlp CLI arguments for retrieving metadata (and optionally subtitles).
-    
-    Args:
-        video_url: YouTube video URL
-        out_dir: Output directory for downloaded files
-        browser: Browser for cookie extraction
-        with_subs: Whether to download subtitles
-        player_client: Player client to impersonate
-        sub_langs: Subtitle language pattern
-        impersonate_target: Target browser for impersonation
-    
-    Returns:
-        List of command line arguments
-    """
-    # Randomize sleep per video so we look human
-    sleep_min = str(random.randint(3, 8))    # 3-8 s between requests (anti-ban)
-    sub_sleep  = str(random.randint(2, 5))   # 2-5 s between subtitle tracks
-    
-    args = [
-        "--extractor-retries", "5",
-        "--remote-components", "ejs:github",
-        "--extractor-args", f"youtube:player_client={player_client};fetch_pot=auto",
-        # Anti-ban: Sleep intervals for rate limiting protection
-        "--min-sleep", sleep_min,
-        "--max-sleep", sleep_min,
-        "--retries", "10",                    # network retry on transient errors
-        "--fragment-retries", "10",
-        "--ignore-errors",
-        "--no-abort-on-error",
-        "--skip-download",
-        "--ignore-no-formats-error",
-        "--write-info-json",
-        "-o", str(out_dir / "%(title)s [%(id)s].%(ext)s"),
-    ]
-    
-    if impersonate_target:
-        args += ["--impersonate", impersonate_target]
-    
-    if with_subs:
-        args += [
-            "--write-sub",
-            "--write-auto-sub",
-            "--sub-langs", sub_langs,
-            "--sleep-subtitles", sub_sleep,
-        ]
-    
+    langs = [lang.strip() for lang in sub_langs.split(",") if lang.strip()]
+    opts = {
+        "skip_download": True,
+        "writeautomaticsub": True,
+        "writesubtitles": True,
+        "subtitleslangs": langs,
+        "subtitlesformat": "vtt",
+        "ignoreerrors": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 5,
+        "remote_components": ["ejs:github"],
+        "extractor_args": {"youtube": {"player_client": [player_client], "fetch_pot": ["auto"]}},
+        "outtmpl": str(out_dir / "%(title)s [%(id)s].%(ext)s"),
+    }
     if browser and browser != "None":
-        if browser.endswith('.txt'):
-            args += ["--cookies", browser]
+        if browser.endswith(".txt"):
+            opts["cookiefile"] = browser
         else:
-            args += ["--cookies-from-browser", browser]
-    
-    args.append(video_url)
-    return args
+            opts["cookiesfrombrowser"] = (browser,)
 
-
-def _subtitle_attempt_plan(player_client: str = "android_vr", sub_langs: str = DEFAULT_SUB_LANGS) -> list:
-    """
-    Generate ordered subtitle extraction attempts from safest to most permissive.
-    
-    Args:
-        player_client: Base player client to use
-        sub_langs: Base subtitle language pattern
-    
-    Returns:
-        List of attempt dictionaries with labels, player_client, sub_langs, impersonate
-    """
-    return [
-        {"label": f"{player_client} english", "player_client": player_client, "sub_langs": sub_langs, "impersonate": ""},
-        {"label": f"{player_client} secondary langs", "player_client": player_client, "sub_langs": SECONDARY_SUB_LANGS, "impersonate": ""},
-        {"label": f"{player_client} all langs", "player_client": player_client, "sub_langs": FALLBACK_SUB_LANGS, "impersonate": ""},
-        {"label": f"{player_client},tv english", "player_client": f"{player_client},tv", "sub_langs": sub_langs, "impersonate": ""},
-        {"label": f"{player_client},tv english (chrome)", "player_client": f"{player_client},tv", "sub_langs": sub_langs, "impersonate": "chrome"},
-    ]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        # extract_info(download=True) both downloads the files and returns the
+        # metadata dict, so the caller knows the exact video id/title to locate
+        # the written files (several videos may share one session dir).
+        return ydl.extract_info(url, download=True)
 
 
 def _find_downloaded_files(video_out_dir: pathlib.Path, video_id: str, title: str) -> list:
@@ -572,9 +351,10 @@ def _pick_best_sub_file(files_found: list) -> pathlib.Path | None:
         return None
     
     ranked_patterns = (
+        "*.ru-orig.*",
+        "*.ru.*",
         "*.en-orig.*",
         "*.en.*",
-        "*.ru.*",
         "*.uk.*",
         "*.vtt",
         "*.srt",
@@ -600,24 +380,17 @@ def _has_usable_subtitles(sub_file: pathlib.Path | None) -> bool:
     return len(cleaned) > 25
 
 
-def _pick_info_json(files_found: list) -> pathlib.Path | None:
-    """Select the info.json file from available downloads."""
-    info_json = next((f for f in files_found if f.name.endswith(".info.json")), None)
-    if info_json:
-        return info_json
-    return next((f for f in files_found if f.suffix == ".json"), None)
-
-
 def download_video_subtitles(url: str, session_id: str, browser: str = "None",
                               player_client: str = "android_vr", sub_langs: str = DEFAULT_SUB_LANGS,
                               group_by_playlist: bool = True, progress_callback=None,
                               error_callback=None, cancel_event=None) -> list:
     """
-    Download subtitles + metadata for a YouTube video with anti-ban protection.
-    
-    Implements: browser cookies, human-like delays, exponential back-off retries,
-    metadata-only fallback on subtitle failure, and private-video detection.
-    
+    Download subtitles + metadata for a single YouTube video and write a
+    cleaned, LLM-ready transcript.
+
+    Uses one yt-dlp call (see _ydlp_download), cleans the best available
+    subtitle track, and writes a .txt under the session's ``processed`` dir.
+
     Args:
         url: YouTube video URL
         session_id: Session directory identifier
@@ -634,167 +407,69 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     Note: This function internally runs on the main thread. For threading,
         wrap it with threading.Thread().
     """
-    processed_files = []
     if cancel_event and cancel_event.is_set():
         raise OperationCancelled("Download cancelled before start.")
 
     session_dir = ensure_session_dir(session_id)
-    
-    title = "YouTube Video"  # Will be updated below
-    
+    title = "YouTube Video"  # Updated from metadata below
+
     if progress_callback:
-        progress_callback(f"Starting download for '{title}'...", 0.0)
-    
-    # Build output directory
-    video_out_dir = session_dir
-    channel_name = ""
-    pl_title = ""
-    
-    # Try full download (subs + metadata) with multiple client/language fallbacks
-    subtitle_download_succeeded = False
-    subtitle_attempt_errors = []
-    attempts = _subtitle_attempt_plan(player_client, sub_langs)
-    
-    for attempt_no, attempt in enumerate(attempts, start=1):
-        if cancel_event and cancel_event.is_set():
-            raise OperationCancelled("Download cancelled during subtitle attempts.")
+        progress_callback(f"Downloading subtitles for '{title}'...", 0.1)
 
-        if progress_callback:
-            progress_callback(
-                f"Attempt {attempt_no}/{len(attempts)} for '{title}': {attempt['label']}",
-                0.1
-            )
-        
-        try:
-            cmd_args = _build_download_cmd(
-                url,
-                video_out_dir,
-                browser,
-                with_subs=True,
-                player_client=attempt["player_client"],
-                sub_langs=attempt["sub_langs"],
-                impersonate_target=attempt["impersonate"],
-            )
-            _run_ydlp_with_retry(cmd_args, cancel_event=cancel_event)
-        except RateLimitError as e:
-            subtitle_attempt_errors.append(str(e))
-            continue
-        except (TransientNetworkError, BotCheckError, PoTokenError, YtDlpCommandError) as e:
-            subtitle_attempt_errors.append(str(e))
-            continue
-        except OperationCancelled:
-            raise
-        except Exception as e:
-            subtitle_attempt_errors.append(str(e))
-            continue
-        
-        files_found = _find_downloaded_files(video_out_dir, "", title)
-        sub_file = _pick_best_sub_file(files_found)
-        
-        if _has_usable_subtitles(sub_file):
-            subtitle_download_succeeded = True
-            break
-        subtitle_attempt_errors.append(f"Downloaded subtitle file was missing/empty on attempt '{attempt['label']}'")
-    
-    if not subtitle_download_succeeded and error_callback and subtitle_attempt_errors:
-        error_callback(
-            f"Subtitle extraction failed for '{title}' after {len(subtitle_attempt_errors)} attempts. "
-            f"Last error: {subtitle_attempt_errors[-1]}"
-        )
-    
-    # Find downloaded files
-    files_found = _find_downloaded_files(video_out_dir, "", title)
-    json_file = _pick_info_json(files_found)
-    
-    # Metadata-only fallback if JSON is missing after failures
-    if not json_file:
-        if cancel_event and cancel_event.is_set():
-            raise OperationCancelled("Download cancelled before metadata fallback.")
-
-        if progress_callback:
-            progress_callback(f"Retrying metadata-only for '{title}'...", 0.3)
-        
-        try:
-            fallback_args = _build_download_cmd(
-                url,
-                video_out_dir,
-                browser,
-                with_subs=False,
-                player_client="android_vr",
-                impersonate_target="",
-            )
-            _run_ydlp_with_retry(fallback_args, cancel_event=cancel_event)
-        except OperationCancelled:
-            raise
-        except Exception as e:
-            if error_callback:
-                error_callback(f"Fallback also failed for '{title}': {e}")
-        
-        files_found = _find_downloaded_files(video_out_dir, "", title)
-        json_file   = _pick_info_json(files_found)
-    
-    if not json_file:
-        if error_callback:
-            error_callback(f"Could not retrieve metadata for '{title}' — skipping.")
-        return []
-    
-    # Parse metadata
+    # Single yt-dlp call: fetches metadata + the best available subtitle track.
+    meta_data = None
     try:
-        with open(json_file, 'r', encoding='utf-8') as f:
-            meta_data = json.load(f)
+        meta_data = _ydlp_download(url, session_dir, browser, sub_langs, player_client)
+    except OperationCancelled:
+        raise
     except Exception as e:
         if error_callback:
-            error_callback(f"Failed to parse JSON for '{title}': {e}")
+            error_callback(f"yt-dlp error for {url}: {e}")
+
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelled("Download cancelled after fetch.")
+
+    if not meta_data:
+        if error_callback:
+            error_callback(f"Could not retrieve metadata for {url} — skipping.")
         return []
-    
-    # Parse title from metadata
-    title = meta_data.get('title', 'Unknown Title')
+
     video_id = meta_data.get('id', '')
+    title = meta_data.get('title', 'Unknown Title')
     pl_title = meta_data.get('playlist_title', '')
     channel_name = meta_data.get('uploader', meta_data.get('uploader_id', ''))
-    
-    # Find best available subtitle
+
+    files_found = _find_downloaded_files(session_dir, video_id, title)
+
     sub_file = _pick_best_sub_file(files_found)
-    
     if _has_usable_subtitles(sub_file):
-        with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
-            transcript_text = clean_vtt_content(f.read())
+        transcript_text = clean_vtt_content(sub_file.read_text(encoding='utf-8', errors='ignore'))
     else:
-        transcript_text = "[No subtitles available — blocked by YouTube or not uploaded by creator]"
-    
-    # Write processed text
+        transcript_text = "[No subtitles available — not uploaded by creator or blocked by YouTube]"
+        if error_callback:
+            error_callback(f"No usable subtitles for '{title}'.")
+
     final_content = format_for_llm(meta_data, transcript_text)
-    
-    # Build output directory path
+
     output_dir = session_dir / "processed"
     if group_by_playlist:
         if channel_name and channel_name not in ('Unknown Channel', ''):
-            safe_ch2 = "".join(c for c in channel_name if c.isalnum() or c in ' -_').strip()
-            output_dir = output_dir / safe_ch2
+            output_dir = output_dir / _safe_name(channel_name)
         if pl_title:
-            safe_pl2 = "".join(c for c in pl_title if c.isalnum() or c in ' -_').strip()
-            output_dir = output_dir / safe_pl2
-    
+            output_dir = output_dir / _safe_name(pl_title)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    safe_title = "".join(c for c in title if c.isalnum() or c in ' -_').strip()
-    final_path = output_dir / f"{safe_title}.txt"
-    
-    with open(final_path, 'w', encoding='utf-8') as f:
-        f.write(final_content)
-    
-    processed_files.append(final_path)
-    
-    # Human-like pause between videos (anti-bot measure)
-    pause = random.uniform(1.0, 3.0)
+
+    final_path = output_dir / f"{_safe_name(title)}.txt"
+    final_path.write_text(final_content, encoding='utf-8')
+
     if cancel_event and cancel_event.is_set():
         raise OperationCancelled("Download cancelled after file write.")
-    time.sleep(pause)
-    
+    time.sleep(random.uniform(1.0, 2.0))  # be polite between videos
+
     if progress_callback:
         progress_callback(f"Done! Harvested '{title}'.", 1.0)
-    
-    return processed_files
+
+    return [final_path]
 
 
 # =============================================================================
@@ -802,7 +477,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
 # =============================================================================
 
 def process_local_files(file_paths: list, session_id: str, progress_callback=None,
-                        error_callback=None, cancel_event=None) -> list:
+                        status_callback=None, error_callback=None, cancel_event=None) -> list:
     """
     Process local subtitle files (.vtt, .srt, .txt) with their metadata.
     
@@ -967,18 +642,52 @@ def merge_files(files: list, strategy: str, session_dir: pathlib.Path) -> list:
     return files
 
 
-# =============================================================================
-# ZIP EXPORT
-# =============================================================================
-
-def zip_files(file_paths: list, output_path: pathlib.Path):
+def download_videos(video_list: list, group_by_playlist: bool, session_id: str, browser: str = "None",
+                    progress_callback=None, status_callback=None, error_callback=None, cancel_event=None) -> list:
     """
-    Create a ZIP archive from a list of file paths.
+    Downloads subtitles for a list of videos by delegating to download_video_subtitles.
+    """
+    processed_files = []
+    total_videos = len(video_list)
     
-    Args:
-        file_paths: List of file paths to include in the ZIP
-        output_path: Output path for the ZIP file
-    """
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in file_paths:
-            zf.write(path, arcname=pathlib.Path(path).name)
+    for i, video in enumerate(video_list):
+        if cancel_event and cancel_event.is_set():
+            if error_callback:
+                error_callback("Download cancelled by user.")
+            break
+            
+        url = video.get('url')
+        if not url:
+            continue
+            
+        title = video.get('title', 'Unknown Title')
+        
+        if progress_callback:
+            progress_callback(f"Processing {i+1}/{total_videos}: {title}", i / max(1, total_videos))
+            
+        try:
+            files = download_video_subtitles(
+                url=url,
+                session_id=session_id,
+                browser=browser,
+                player_client="android_vr",
+                sub_langs=DEFAULT_SUB_LANGS,
+                group_by_playlist=group_by_playlist,
+                progress_callback=status_callback,
+                error_callback=error_callback,
+                cancel_event=cancel_event
+            )
+            if files:
+                processed_files.extend(files)
+        except OperationCancelled:
+            if error_callback:
+                error_callback("Download cancelled.")
+            break
+        except Exception as e:
+            if error_callback:
+                error_callback(f"Failed to process {title}: {e}")
+                
+    if progress_callback and not (cancel_event and cancel_event.is_set()):
+        progress_callback("All downloads complete!", 1.0)
+        
+    return processed_files
