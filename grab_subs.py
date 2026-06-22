@@ -12,6 +12,7 @@ the hardcoded English ones.
 
 import pathlib
 import shutil
+import time
 import yt_dlp
 
 import core
@@ -41,8 +42,8 @@ def safe_name(s: str) -> str:
     return "".join(c for c in s if c.isalnum() or c in " -_()").strip()[:150]
 
 
-def grab(url: str) -> tuple[str, str | None]:
-    """Download best Russian subtitle for one video. Returns (title, txt_path)."""
+def _attempt(url: str) -> tuple[str, str | None]:
+    """One download+extract attempt. Returns (title, txt_path or None)."""
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     opts = {
         "skip_download": True,
@@ -85,6 +86,27 @@ def grab(url: str) -> tuple[str, str | None]:
     out = OUT_DIR / f"{safe_name(title)}.txt"
     out.write_text(f"# {title}\n# {url}\n\n{cleaned}\n", encoding="utf-8")
     return title, str(out)
+
+
+def grab(url: str, max_attempts: int = 3) -> tuple[str, str | None]:
+    """
+    Download best Russian subtitle for one video, returning (title, txt_path).
+
+    Retries on transient failures: a curl/TLS/network hiccup can make a single
+    yt-dlp call return no metadata or an empty subtitle even when the video is
+    fine.
+    """
+    title = url
+    for attempt in range(1, max_attempts + 1):
+        try:
+            title, path = _attempt(url)
+            if path:
+                return title, path
+        except Exception:
+            pass
+        if attempt < max_attempts:
+            time.sleep(2 * attempt)
+    return title, None
 
 
 def main():

@@ -416,32 +416,42 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     if progress_callback:
         progress_callback(f"Downloading subtitles for '{title}'...", 0.1)
 
-    # Single yt-dlp call: fetches metadata + the best available subtitle track.
+    # One yt-dlp call fetches metadata + the best available subtitle track.
+    # Retried a few times: transient curl/TLS/network hiccups can make a single
+    # call return no metadata or an empty subtitle even when the video is fine.
     meta_data = None
-    try:
-        meta_data = _ydlp_download(url, session_dir, browser, sub_langs, player_client)
-    except OperationCancelled:
-        raise
-    except Exception as e:
-        if error_callback:
-            error_callback(f"yt-dlp error for {url}: {e}")
+    sub_file = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        if cancel_event and cancel_event.is_set():
+            raise OperationCancelled("Download cancelled after fetch.")
+        try:
+            meta_data = _ydlp_download(url, session_dir, browser, sub_langs, player_client)
+        except OperationCancelled:
+            raise
+        except Exception as e:
+            meta_data = None
+            if error_callback and attempt == max_attempts:
+                error_callback(f"yt-dlp error for {url}: {e}")
 
-    if cancel_event and cancel_event.is_set():
-        raise OperationCancelled("Download cancelled after fetch.")
+        if meta_data:
+            files_found = _find_downloaded_files(
+                session_dir, meta_data.get('id', ''), meta_data.get('title', ''))
+            sub_file = _pick_best_sub_file(files_found)
+            if _has_usable_subtitles(sub_file):
+                break  # got usable subtitles — stop retrying
+        if attempt < max_attempts:
+            time.sleep(2 * attempt)  # brief backoff before retrying
 
     if not meta_data:
         if error_callback:
             error_callback(f"Could not retrieve metadata for {url} — skipping.")
         return []
 
-    video_id = meta_data.get('id', '')
     title = meta_data.get('title', 'Unknown Title')
     pl_title = meta_data.get('playlist_title', '')
     channel_name = meta_data.get('uploader', meta_data.get('uploader_id', ''))
 
-    files_found = _find_downloaded_files(session_dir, video_id, title)
-
-    sub_file = _pick_best_sub_file(files_found)
     if _has_usable_subtitles(sub_file):
         transcript_text = clean_vtt_content(sub_file.read_text(encoding='utf-8', errors='ignore'))
     else:
