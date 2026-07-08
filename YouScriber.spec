@@ -46,5 +46,5 @@ app = BUNDLE(
     coll,
     name='YouScriber.app',
     icon=None,
-    bundle_identifier=None,
+    bundle_identifier='com.youscriber.app',
 )

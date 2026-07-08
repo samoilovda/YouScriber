@@ -1,19 +1,21 @@
 """
-YouScriber - Shared Business Logic Layer
+YouScriber - Core Business Logic Layer
 
 This module contains the core ETL business logic for YouTube subtitle extraction,
-cleaning, and LLM-RAG preparation. It is shared between both the Streamlit web
-interface and the CustomTkinter desktop interface.
+cleaning, and LLM-RAG preparation. It is used by the CustomTkinter desktop
+interface (gui.py) and by the batch CLI script (grab_subs.py).
 
-PRODUCTION ANTI-BAN CONFIGURATION:
-- Uses Safari browser cookies for authentication
-- Implements randomized sleep intervals (3-8 seconds) to avoid rate limiting
-- Handles YouTube's anti-bot measures including PO tokens and 429 errors
+RATE-LIMIT / ANTI-BOT HANDLING:
+- Browser cookie authentication is supported but disabled by default
+  (browser="None"); pass a browser name or a cookies.txt path to enable it.
+- A short randomized delay (1-2 seconds) is inserted between video downloads.
+- Retries and the android_vr player client help avoid PO-token/429 errors.
 """
 
 import yt_dlp
 import pathlib
 import re
+import shutil
 import tempfile
 import json
 import os
@@ -28,6 +30,11 @@ import time
 
 BASE_TEMP_DIR = pathlib.Path(tempfile.gettempdir()) / "youscriber"
 
+# Placeholder transcript text written when a video has no usable subtitle
+# track. Exported so callers (e.g. grab_subs.py) can detect this case without
+# duplicating the literal string.
+NO_SUBTITLES_PLACEHOLDER = "[No subtitles available — not uploaded by creator or blocked by YouTube]"
+
 # Default subtitle language preferences (configurable via environment variables)
 # Prefer the original-language auto-caption track (-orig) first, then plain
 # language tracks, then English. This works for Russian-language channels as
@@ -41,6 +48,25 @@ def ensure_session_dir(session_id: str) -> pathlib.Path:
     if not session_dir.exists():
         session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
+
+
+def cleanup_old_sessions(max_age_days: int = 7) -> None:
+    """
+    Remove session directories under BASE_TEMP_DIR older than max_age_days.
+
+    Session dirs are never cleaned up automatically otherwise, so long-running
+    use of the app would let temp files grow unbounded. Safe to call at
+    startup; failures for individual dirs are ignored (e.g. file in use).
+    """
+    if not BASE_TEMP_DIR.exists():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    for session_dir in BASE_TEMP_DIR.iterdir():
+        try:
+            if session_dir.is_dir() and session_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(session_dir, ignore_errors=True)
+        except OSError:
+            pass
 
 
 # =============================================================================
@@ -194,7 +220,7 @@ def fetch_video_list(urls: list, browser: str = "None", player_client: str = "an
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android_vr'],
+                'player_client': [player_client],
                 'fetch_pot': ['auto'],
             }
         },
@@ -455,7 +481,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     if _has_usable_subtitles(sub_file):
         transcript_text = clean_vtt_content(sub_file.read_text(encoding='utf-8', errors='ignore'))
     else:
-        transcript_text = "[No subtitles available — not uploaded by creator or blocked by YouTube]"
+        transcript_text = NO_SUBTITLES_PLACEHOLDER
         if error_callback:
             error_callback(f"No usable subtitles for '{title}'.")
 
@@ -487,7 +513,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
 # =============================================================================
 
 def process_local_files(file_paths: list, session_id: str, progress_callback=None,
-                        status_callback=None, error_callback=None, cancel_event=None) -> list:
+                        error_callback=None, cancel_event=None) -> list:
     """
     Process local subtitle files (.vtt, .srt, .txt) with their metadata.
     
@@ -627,7 +653,7 @@ def merge_files(files: list, strategy: str, session_dir: pathlib.Path) -> list:
             if not content_list: return None
             fname = merged_output_dir / f"Merged_Batch_{idx:03d}.txt"
             with open(fname, 'w', encoding='utf-8') as f:
-                f.write("\n\n" + "="*40 + "\n\n".join(content_list))
+                f.write(("\n\n" + "="*40 + "\n\n").join(content_list))
             return fname
         
         for fpath in sorted_files:

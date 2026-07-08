@@ -3,6 +3,8 @@ from tkinter import filedialog, messagebox
 import threading
 import uuid
 import subprocess
+import sys
+import os
 import core
 import pathlib
 
@@ -17,6 +19,7 @@ class App(ctk.CTk):
         
         self.session_id = str(uuid.uuid4())
         self.cancel_event = threading.Event()
+        threading.Thread(target=core.cleanup_old_sessions, daemon=True).start()
         self.video_list = []
         self.list_type = "videos"
         self.local_files = []
@@ -317,7 +320,7 @@ class App(ctk.CTk):
     def _expand_and_harvest_thread(self, playlists, group, browser):
         def stat_cb(msg): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
-        def prog_cb(pct, msg): self.after(0, self.update_progress, pct, msg, "youtube")
+        def prog_cb(msg, pct): self.after(0, self.update_progress, pct, msg, "youtube")
         
         stat_cb("Expanding selected playlists into individual videos...")
         playlist_urls = [p.get('url') for p in playlists if p.get('url')]
@@ -336,7 +339,7 @@ class App(ctk.CTk):
         self.after(0, self._on_harvest_complete, files)
 
     def _harvest_thread(self, videos, group, browser):
-        def prog_cb(pct, msg): self.after(0, self.update_progress, pct, msg, "youtube")
+        def prog_cb(msg, pct): self.after(0, self.update_progress, pct, msg, "youtube")
         def stat_cb(msg): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
         
@@ -368,7 +371,7 @@ class App(ctk.CTk):
         threading.Thread(target=self._local_thread, args=(self.local_files,), daemon=True).start()
 
     def _local_thread(self, files):
-        def prog_cb(pct, msg): self.after(0, self.update_progress, pct, msg, "local")
+        def prog_cb(msg, pct): self.after(0, self.update_progress, pct, msg, "local")
         def stat_cb(msg): self.after(0, self.update_status, msg, "local")
         def err_cb(msg): self.after(0, self.show_error, msg)
         
@@ -402,8 +405,17 @@ class App(ctk.CTk):
         out_folder = str(final_files[0].parent if final_files else session_dir)
         messagebox.showinfo("Merge Complete", f"Files successfully merged/prepared in:\n{out_folder}")
         
+        self._open_folder(out_folder)
+
+    def _open_folder(self, folder: str):
+        """Open a folder in the OS file browser, tolerating non-macOS platforms."""
         try:
-            subprocess.run(["open", out_folder])
+            if sys.platform == "darwin":
+                subprocess.run(["open", folder])
+            elif sys.platform == "win32":
+                os.startfile(folder)
+            else:
+                subprocess.run(["xdg-open", folder])
         except Exception:
             pass
 
