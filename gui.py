@@ -265,10 +265,16 @@ class App(ctk.CTk):
         threading.Thread(target=self._fetch_thread, args=(urls, browser), daemon=True).start()
 
     def _fetch_thread(self, urls, browser):
-        def status_cb(msg): self.after(0, self.update_status, msg, "youtube")
+        # core passes (message, percentage) to progress callbacks; pct is optional
+        # here so the same callback also works where core emits status only.
+        def status_cb(msg, pct=None): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
-        
-        videos = core.fetch_video_list(urls, browser, progress_callback=status_cb, error_callback=err_cb, cancel_event=self.cancel_event)
+
+        try:
+            videos = core.fetch_video_list(urls, browser, progress_callback=status_cb, error_callback=err_cb, cancel_event=self.cancel_event)
+        except Exception as e:
+            err_cb(f"Fetch failed: {e}")
+            videos = []
         self.after(0, self._on_fetch_complete, videos)
 
     def _on_fetch_complete(self, videos):
@@ -318,32 +324,38 @@ class App(ctk.CTk):
             threading.Thread(target=self._harvest_thread, args=(selected_items, group, browser), daemon=True).start()
 
     def _expand_and_harvest_thread(self, playlists, group, browser):
-        def stat_cb(msg): self.after(0, self.update_status, msg, "youtube")
+        def stat_cb(msg, pct=None): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
         def prog_cb(msg, pct): self.after(0, self.update_progress, pct, msg, "youtube")
-        
-        stat_cb("Expanding selected playlists into individual videos...")
-        playlist_urls = [p.get('url') for p in playlists if p.get('url')]
-        
-        expanded_videos = core.fetch_video_list(playlist_urls, browser, progress_callback=stat_cb, error_callback=err_cb, cancel_event=self.cancel_event)
-        
-        if not expanded_videos:
-            err_cb("Failed to expand any videos from the selected playlists.")
-            self.after(0, lambda: self.harvest_btn.configure(state="normal"))
-            self.after(0, lambda: self.fetch_btn.configure(state="normal"))
-            self.after(0, lambda: self.fetch_channel_btn.configure(state="normal"))
-            return
-            
-        stat_cb(f"Successfully expanded into {len(expanded_videos)} videos.")
-        files = core.download_videos(expanded_videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb, self.cancel_event)
+
+        try:
+            stat_cb("Expanding selected playlists into individual videos...")
+            playlist_urls = [p.get('url') for p in playlists if p.get('url')]
+
+            expanded_videos = core.fetch_video_list(playlist_urls, browser, progress_callback=stat_cb, error_callback=err_cb, cancel_event=self.cancel_event)
+
+            if not expanded_videos:
+                err_cb("Failed to expand any videos from the selected playlists.")
+                self.after(0, self._on_harvest_complete, [])
+                return
+
+            stat_cb(f"Successfully expanded into {len(expanded_videos)} videos.")
+            files = core.download_videos(expanded_videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb, self.cancel_event)
+        except Exception as e:
+            err_cb(f"Harvest failed: {e}")
+            files = []
         self.after(0, self._on_harvest_complete, files)
 
     def _harvest_thread(self, videos, group, browser):
         def prog_cb(msg, pct): self.after(0, self.update_progress, pct, msg, "youtube")
-        def stat_cb(msg): self.after(0, self.update_status, msg, "youtube")
+        def stat_cb(msg, pct=None): self.after(0, self.update_status, msg, "youtube")
         def err_cb(msg): self.after(0, self.show_error, msg)
-        
-        files = core.download_videos(videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb, self.cancel_event)
+
+        try:
+            files = core.download_videos(videos, group, self.session_id, browser, prog_cb, stat_cb, err_cb, self.cancel_event)
+        except Exception as e:
+            err_cb(f"Harvest failed: {e}")
+            files = []
         self.after(0, self._on_harvest_complete, files)
 
     def _on_harvest_complete(self, files):
@@ -353,7 +365,12 @@ class App(ctk.CTk):
         self.cancel_btn.configure(state="disabled")
         self.processed_files.extend(files)
         self.update_export_tab()
-        messagebox.showinfo("Done", f"Harvested {len(files)} files successfully.")
+        if files:
+            self.update_status(f"Harvested {len(files)} files.", "youtube")
+            messagebox.showinfo("Done", f"Harvested {len(files)} files successfully.")
+        else:
+            self.update_status("No files harvested.", "youtube")
+            messagebox.showwarning("Nothing harvested", "No transcripts were produced. See the status line and any error dialogs for details.")
 
     # --------------- LOCAL LOGIC ---------------
     def select_local_files(self):
@@ -367,22 +384,36 @@ class App(ctk.CTk):
         if not self.local_files: return
         self.process_local_btn.configure(state="disabled")
         self.local_progress_bar.set(0)
-        
+        # A cancel from an earlier YouTube run would otherwise abort this one instantly.
+        self.cancel_event.clear()
+
         threading.Thread(target=self._local_thread, args=(self.local_files,), daemon=True).start()
 
     def _local_thread(self, files):
         def prog_cb(msg, pct): self.after(0, self.update_progress, pct, msg, "local")
-        def stat_cb(msg): self.after(0, self.update_status, msg, "local")
         def err_cb(msg): self.after(0, self.show_error, msg)
-        
-        res = core.process_local_files(files, self.session_id, prog_cb, stat_cb, err_cb, self.cancel_event)
+
+        try:
+            res = core.process_local_files(
+                files,
+                self.session_id,
+                progress_callback=prog_cb,
+                error_callback=err_cb,
+                cancel_event=self.cancel_event,
+            )
+        except Exception as e:
+            err_cb(f"Local processing failed: {e}")
+            res = []
         self.after(0, self._on_local_complete, res)
 
     def _on_local_complete(self, files):
         self.process_local_btn.configure(state="normal")
         self.processed_files.extend(files)
         self.update_export_tab()
-        messagebox.showinfo("Done", f"Processed {len(files)} local files.")
+        if files:
+            messagebox.showinfo("Done", f"Processed {len(files)} local files.")
+        else:
+            messagebox.showwarning("Nothing processed", "No local files were processed. See the status line for details.")
 
     # --------------- EXPORT LOGIC ---------------
     def update_export_tab(self):

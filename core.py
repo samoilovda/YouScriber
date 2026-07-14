@@ -73,25 +73,35 @@ def cleanup_old_sessions(max_age_days: int = 7) -> None:
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def emit_progress(callback, msg: str, pct: float = 0.0) -> None:
+    """
+    Invoke a progress callback, tolerating both ``cb(msg)`` and ``cb(msg, pct)``.
+
+    Callers pass status-only or status+percentage callbacks interchangeably; an
+    arity mismatch here used to raise TypeError inside a worker thread, killing
+    it silently and leaving the GUI's buttons permanently disabled.
+    """
+    if not callback:
+        return
+    try:
+        callback(msg, pct)
+    except TypeError:
+        callback(msg)
+
+
 class CallbackLogger:
     """Simple callback logger for yt-dlp."""
-    
+
     def __init__(self, error_callback=None, status_callback=None):
         self.error_callback = error_callback
         self.status_callback = status_callback
-    
+
     def debug(self, msg):
         pass
 
     def _emit_status(self, msg):
-        """Emit a status message while tolerating 1-arg or 2-arg callbacks."""
-        if not self.status_callback:
-            return
-        try:
-            self.status_callback(msg, 0.0)
-        except TypeError:
-            self.status_callback(msg)
-    
+        emit_progress(self.status_callback, msg, 0.0)
+
     def warning(self, msg):
         self._emit_status(msg)
     
@@ -233,10 +243,9 @@ def fetch_video_list(urls: list, browser: str = "None", player_client: str = "an
         flat_opts['cookiesfrombrowser'] = (browser,)
     
     video_list = []
-    
-    if progress_callback:
-        progress_callback("Fetching metadata using yt-dlp...", 0.0)
-    
+
+    emit_progress(progress_callback, "Fetching metadata using yt-dlp...", 0.0)
+
     with yt_dlp.YoutubeDL(flat_opts) as ydl:
         for url in urls:
             if cancel_event and cancel_event.is_set():
@@ -439,8 +448,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
     session_dir = ensure_session_dir(session_id)
     title = "YouTube Video"  # Updated from metadata below
 
-    if progress_callback:
-        progress_callback(f"Downloading subtitles for '{title}'...", 0.1)
+    emit_progress(progress_callback, f"Downloading subtitles for '{title}'...", 0.1)
 
     # One yt-dlp call fetches metadata + the best available subtitle track.
     # Retried a few times: transient curl/TLS/network hiccups can make a single
@@ -502,8 +510,7 @@ def download_video_subtitles(url: str, session_id: str, browser: str = "None",
         raise OperationCancelled("Download cancelled after file write.")
     time.sleep(random.uniform(1.0, 2.0))  # be polite between videos
 
-    if progress_callback:
-        progress_callback(f"Done! Harvested '{title}'.", 1.0)
+    emit_progress(progress_callback, f"Done! Harvested '{title}'.", 1.0)
 
     return [final_path]
 
@@ -533,8 +540,7 @@ def process_local_files(file_paths: list, session_id: str, progress_callback=Non
     file_map = {}
     total_files = len(file_paths)
     
-    if progress_callback:
-        progress_callback(f"Analyzing {total_files} local files...", 0.0)
+    emit_progress(progress_callback, f"Analyzing {total_files} local files...", 0.0)
     
     for path_str in file_paths:
         path = pathlib.Path(path_str)
@@ -557,8 +563,7 @@ def process_local_files(file_paths: list, session_id: str, progress_callback=Non
                 error_callback("Local processing cancelled by user.")
             break
 
-        if progress_callback:
-            progress_callback(f"Processing local file: {stem}", count / max(1, total_stems))
+        emit_progress(progress_callback, f"Processing local file: {stem}", count / max(1, total_stems))
             
         if 'sub' in files:
             sub_file = files['sub']
@@ -595,11 +600,10 @@ def process_local_files(file_paths: list, session_id: str, progress_callback=Non
                     error_callback(f"Failed to process {stem}: {str(e)}")
         count += 1
     
-    if progress_callback:
-        if cancel_event and cancel_event.is_set():
-            progress_callback("Local processing cancelled.", 1.0)
-        else:
-            progress_callback("Finished processing local files.", 1.0)
+    if cancel_event and cancel_event.is_set():
+        emit_progress(progress_callback, "Local processing cancelled.", 1.0)
+    else:
+        emit_progress(progress_callback, "Finished processing local files.", 1.0)
     
     return processed_files
 
@@ -698,8 +702,7 @@ def download_videos(video_list: list, group_by_playlist: bool, session_id: str, 
             
         title = video.get('title', 'Unknown Title')
         
-        if progress_callback:
-            progress_callback(f"Processing {i+1}/{total_videos}: {title}", i / max(1, total_videos))
+        emit_progress(progress_callback, f"Processing {i+1}/{total_videos}: {title}", i / max(1, total_videos))
             
         try:
             files = download_video_subtitles(
@@ -723,7 +726,7 @@ def download_videos(video_list: list, group_by_playlist: bool, session_id: str, 
             if error_callback:
                 error_callback(f"Failed to process {title}: {e}")
                 
-    if progress_callback and not (cancel_event and cancel_event.is_set()):
-        progress_callback("All downloads complete!", 1.0)
+    if not (cancel_event and cancel_event.is_set()):
+        emit_progress(progress_callback, "All downloads complete!", 1.0)
         
     return processed_files
