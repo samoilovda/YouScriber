@@ -683,7 +683,8 @@ def merge_files(files: list, strategy: str, session_dir: pathlib.Path) -> list:
 
 
 def download_videos(video_list: list, group_by_playlist: bool, session_id: str, browser: str = "None",
-                    progress_callback=None, status_callback=None, error_callback=None, cancel_event=None) -> list:
+                    player_client: str = "android_vr", progress_callback=None, status_callback=None, 
+                    error_callback=None, cancel_event=None) -> list:
     """
     Downloads subtitles for a list of videos by delegating to download_video_subtitles.
     """
@@ -709,7 +710,7 @@ def download_videos(video_list: list, group_by_playlist: bool, session_id: str, 
                 url=url,
                 session_id=session_id,
                 browser=browser,
-                player_client="android_vr",
+                player_client=player_client,
                 sub_langs=DEFAULT_SUB_LANGS,
                 group_by_playlist=group_by_playlist,
                 progress_callback=status_callback,

@@ -1,104 +1,88 @@
 # YouScriber
 
-Извлечение субтитров из YouTube-видео, их очистка (без тайм-кодов и тегов) и
-подготовка текста для передачи в LLM / написания книги.
+Desktop GUI + CLI utility for extracting YouTube subtitles (from videos, playlists, or channels) and preparing the text for LLMs. It cleans VTT/SRT files by removing timecodes and tags, deduplicates "growing" auto-generated subtitles, formats them with metadata, and merges them into chunks optimized for LLM context windows (~50k/~200k characters). 
 
-## Установка
+It does **not** download video or audio, and `ffmpeg` is **not** required.
 
-1. Python 3.10+.
-2. Зависимости:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   Для разработки (тесты, линтер) дополнительно:
-   ```bash
-   pip install -r requirements-dev.txt
-   ```
+![YouScriber GUI](TODO) <!-- Placeholder for GUI screenshot -->
 
-`ffmpeg` не требуется — приложение только скачивает и чистит субтитры, видео/аудио
-не обрабатывается.
+## Architecture & Features
+- **Clean Architecture:** All business logic is encapsulated in `core.py`. The GUI (CustomTkinter) and CLI are thin wrappers. Pure functions are tested offline (22 pytest tests, no network required). 
+- **Anti-Rate-Limit Measures:** Uses a single batch request for subtitles instead of per-language requests to prevent HTTP 429 errors. Includes random 1-2s pauses, retries with exponential backoff, and impersonates `player_client=android_vr` to bypass current bot protections.
+- **Graceful Degradation:** If a video lacks subtitles, it outputs an explicit placeholder rather than an empty file. A single failed video will not interrupt a batch process.
+- **Local Mode:** Can process already downloaded `.vtt`, `.srt`, or `.txt` files locally without network access.
+- **Standalone App:** Can be built as a standalone `.app` using PyInstaller.
 
-## Способы использования
-
-### 1. Десктоп-приложение (GUI)
-
-```bash
-python gui.py
-```
-
-Откроется окно: вставьте ссылки на видео/плейлисты/каналы (по одной в строке),
-при необходимости настройте слияние файлов и нажмите запуск. Готовые `.txt`
-сохраняются во временную сессию и открываются по кнопке.
-
-Сборка standalone-приложения (`dist/YouScriber.app`):
-```bash
-pyinstaller YouScriber.spec
-```
-Собранный `.app` не требует установленного Python на целевой машине.
-
-### 2. Пакетный скрипт (CLI)
-
-```bash
-python grab_subs.py URL [URL ...]
-# либо список URL в файле (по одному на строку, строки с # игнорируются):
-python grab_subs.py --urls-file urls.txt
-```
-
-Полезные флаги: `--out-dir` (куда писать `.txt`, по умолчанию `output/transcripts/`),
-`--sub-langs` (см. ниже), `--browser` (cookies для авторизации). Подробности:
-`python grab_subs.py --help`.
-
-## Язык субтитров
-
-По умолчанию берётся оригинальная дорожка: `ru-orig, ru, en-orig, en`
-(подходит и для русских, и для английских каналов). Переопределить можно
-переменной окружения:
-
-```bash
-export YOUSCRIBER_SUB_LANGS='en-orig,en'
-```
-
-> Примечание: используются автоматические субтитры (распознавание речи), в них
-> возможны ошибки распознавания — это сырьё под дальнейшую обработку.
-
-## Сетевые требования и обслуживание
-
-Приложению для работы всегда нужен доступ к YouTube. Иногда (когда YouTube меняет
-защиту от ботов) yt-dlp дополнительно подтягивает JS-компонент с GitHub
-(`yt-dlp-ejs`) — это происходит лениво, только когда действительно требуется, и не
-мешает автономности приложения при обычной работе.
-
-Единственная предполагаемая точка обслуживания продукта — **обновление yt-dlp**,
-когда YouTube меняет что-то на своей стороне и загрузка перестаёт работать:
-
+## Maintenance (One Command)
+If YouTube updates its anti-bot protections and extraction stops working, simply update the core dependency:
 ```bash
 pip install -U yt-dlp
 ```
 
-Версия в `requirements.txt` запиннена на протестированную; при сборке standalone
-`.app` через PyInstaller не забудьте пересобрать после обновления.
+## Usage
 
-## Тесты
+| Method | Best For | How to Run |
+|---|---|---|
+| **GUI** | Everyday use, easy configuration | `python gui.py` |
+| **CLI** | Automation, batch processing from files | `python grab_subs.py URL1 URL2` |
+| **Standalone App** | Running without Python installed | Build: `pyinstaller YouScriber.spec` |
 
+### CLI Example
 ```bash
-make test        # или: pytest tests/ -v
-make lint         # pyflakes по core.py, gui.py, grab_subs.py, tests/
+# Process multiple URLs or pass a file with URLs:
+python grab_subs.py "https://youtube.com/watch?v=..."
+python grab_subs.py --urls-file urls.txt
 ```
 
-Тесты офлайновые — покрывают очистку субтитров, форматирование, слияние файлов и
-выбор лучшей субтитровой дорожки. Сеть/yt-dlp не используются.
+## Known Limitations
+- **No e2e testing on real videos:** End-to-end tests require network access and are currently executed manually (see `FINALIZE.md` checklist).
+- **No CI pipeline.**
+- **Cookies are disabled by default.**
 
-## Структура
+---
+*Built with AI-assisted development.*
 
-| Файл | Назначение |
-|------|------------|
-| `core.py` | Вся бизнес-логика: загрузка, очистка, слияние, экспорт |
-| `gui.py` | Десктоп-интерфейс (CustomTkinter) |
-| `grab_subs.py` | CLI-скрипт пакетной выгрузки |
-| `YouScriber.spec` | Конфиг сборки PyInstaller |
-| `tests/` | Офлайн-тесты бизнес-логики (pytest) |
-| `Makefile` | Команды `install`, `test`, `lint`, `run`, `build` |
+---
 
-## Лицензия
+# YouScriber (RU)
 
-[MIT](LICENSE) — свободное использование, изменение и распространение.
+Desktop GUI + CLI утилита для извлечения субтитров YouTube (видео, плейлисты, каналы) и подготовки текста под LLM. Она очищает VTT/SRT от таймкодов и тегов, дедуплицирует «нарастающие» авто-субтитры, форматирует текст с метаданными и сливает его в чанки под контекстные окна (~50k/~200k символов). 
+
+Утилита **не качает** видео или аудио, `ffmpeg` **не нужен**.
+
+![YouScriber GUI](TODO) <!-- Placeholder for GUI screenshot -->
+
+## Архитектура и фичи
+- **Чистая архитектура:** Вся бизнес-логика находится в `core.py`. GUI (CustomTkinter) и CLI — тонкие обёртки. Чистые функции тестируются офлайн (22 pytest-теста без сети). Есть `Makefile`.
+- **Anti-rate-limit решения:** Один пакетный запрос субтитров вместо запроса-на-язык (против HTTP 429), случайные паузы 1–2 с, ретраи с backoff, `player_client=android_vr` против текущих защит.
+- **Понятная деградация:** Нет субтитров → явный плейсхолдер, а не пустой файл. Одно упавшее видео не рвёт пакет.
+- **Локальный режим:** Обработка уже скачанных `.vtt`, `.srt`, `.txt` без сети.
+- **Standalone .app:** Собирается через PyInstaller (проверено на macOS).
+
+## Обслуживание одной командой
+Если YouTube меняет защиту и загрузка ломается, достаточно обновить основную зависимость:
+```bash
+pip install -U yt-dlp
+```
+
+## Использование
+
+| Интерфейс | Для чего | Запуск |
+|---|---|---|
+| **GUI** | Повседневное использование | `python gui.py` |
+| **CLI** | Автоматизация, пакетная обработка | `python grab_subs.py URL1 URL2` |
+| **Standalone App** | Работа без Python | Сборка: `pyinstaller YouScriber.spec` |
+
+### Пример CLI
+```bash
+python grab_subs.py "https://youtube.com/watch?v=..."
+python grab_subs.py --urls-file urls.txt
+```
+
+## Известные ограничения
+- **Нет e2e-тестов на реальном видео:** Требуют сети, сейчас проверяются по ручному чек-листу (см. `FINALIZE.md`).
+- **Нет CI.**
+- **Cookies выключены по умолчанию.**
+
+---
+*Создано при поддержке ИИ (AI-assisted development).*

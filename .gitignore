@@ -41,3 +41,6 @@ output/
 
 # Mac
 .DS_Store
+
+# User configs
+config.json
